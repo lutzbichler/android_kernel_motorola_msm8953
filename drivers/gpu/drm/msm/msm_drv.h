@@ -2,6 +2,8 @@
  * Copyright (C) 2013 Red Hat
  * Author: Rob Clark <robdclark@gmail.com>
  *
+ * Copyright (c) 2017 The Linux Foundation. All rights reserved.
+ *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License version 2 as published by
  * the Free Software Foundation.
@@ -32,6 +34,7 @@
 #include <linux/types.h>
 #include <linux/of_graph.h>
 #include <asm/sizes.h>
+#include <linux/kthread.h>
 
 #ifndef CONFIG_OF
 #include <mach/board.h>
@@ -48,6 +51,8 @@
 #include <drm/msm_drm.h>
 #include <drm/drm_gem.h>
 
+#include "msm_evtlog.h"
+
 struct msm_kms;
 struct msm_gpu;
 struct msm_mmu;
@@ -55,7 +60,7 @@ struct msm_rd_state;
 struct msm_perf_state;
 struct msm_gem_submit;
 
-#define NUM_DOMAINS    2    /* one for KMS, then one per gpu core (?) */
+#define NUM_DOMAINS    6    /* four for KMS, then two for GPU */
 #define MAX_CRTCS      8
 #define MAX_PLANES     12
 #define MAX_ENCODERS   8
@@ -71,16 +76,152 @@ struct msm_file_private {
 };
 
 enum msm_mdp_plane_property {
-	PLANE_PROP_ZPOS,
+	/* blob properties, always put these first */
+	PLANE_PROP_SCALER,
+	PLANE_PROP_CSC,
+	PLANE_PROP_INFO,
+
+	/* # of blob properties */
+	PLANE_PROP_BLOBCOUNT,
+
+	/* range properties */
+	PLANE_PROP_ZPOS = PLANE_PROP_BLOBCOUNT,
 	PLANE_PROP_ALPHA,
-	PLANE_PROP_PREMULTIPLIED,
-	PLANE_PROP_MAX_NUM
+	PLANE_PROP_COLOR_FILL,
+	PLANE_PROP_INPUT_FENCE,
+
+	/* enum/bitmask properties */
+	PLANE_PROP_ROTATION,
+	PLANE_PROP_BLEND_OP,
+	PLANE_PROP_SRC_CONFIG,
+
+	/* total # of properties */
+	PLANE_PROP_COUNT
+};
+
+enum msm_mdp_crtc_property {
+	/* # of blob properties */
+	CRTC_PROP_BLOBCOUNT,
+
+	/* range properties */
+	CRTC_PROP_INPUT_FENCE_TIMEOUT = CRTC_PROP_BLOBCOUNT,
+	CRTC_PROP_OUTPUT_FENCE,
+
+	/* total # of properties */
+	CRTC_PROP_COUNT
+};
+
+enum msm_mdp_conn_property {
+	/* blob properties, always put these first */
+	CONNECTOR_PROP_SDE_INFO,
+
+	/* # of blob properties */
+	CONNECTOR_PROP_BLOBCOUNT,
+
+	/* range properties */
+	CONNECTOR_PROP_OUT_FB = CONNECTOR_PROP_BLOBCOUNT,
+	CONNECTOR_PROP_RETIRE_FENCE,
+	CONNECTOR_PROP_DST_X,
+	CONNECTOR_PROP_DST_Y,
+	CONNECTOR_PROP_DST_W,
+	CONNECTOR_PROP_DST_H,
+
+	/* enum/bitmask properties */
+	CONNECTOR_PROP_TOPOLOGY_NAME,
+	CONNECTOR_PROP_TOPOLOGY_CONTROL,
+
+	/* total # of properties */
+	CONNECTOR_PROP_COUNT
+};
+
+enum msm_mdp_display_id {
+	DISPLAY_ID_NONE,
+	DISPLAY_ID_PRIMARY,
+	DISPLAY_ID_SECONDARY,
+	DISPLAY_ID_TERTIARY,
+	DISPLAY_ID_QUATERNARY,
+	DISPLAY_ID_MAX
 };
 
 struct msm_vblank_ctrl {
-	struct work_struct work;
+	struct kthread_work work;
 	struct list_head event_list;
 	spinlock_t lock;
+};
+
+#define MAX_H_TILES_PER_DISPLAY 2
+
+/**
+ * enum msm_display_compression - compression method used for pixel stream
+ * @MSM_DISPLAY_COMPRESS_NONE:     Pixel data is not compressed
+ * @MSM_DISPLAY_COMPRESS_DSC:      DSC compresison is used
+ * @MSM_DISPLAY_COMPRESS_FBC:      FBC compression is used
+ */
+enum msm_display_compression {
+	MSM_DISPLAY_COMPRESS_NONE,
+	MSM_DISPLAY_COMPRESS_DSC,
+	MSM_DISPLAY_COMPRESS_FBC,
+};
+
+/**
+ * enum msm_display_caps - features/capabilities supported by displays
+ * @MSM_DISPLAY_CAP_VID_MODE:           Video or "active" mode supported
+ * @MSM_DISPLAY_CAP_CMD_MODE:           Command mode supported
+ * @MSM_DISPLAY_CAP_HOT_PLUG:           Hot plug detection supported
+ * @MSM_DISPLAY_CAP_EDID:               EDID supported
+ */
+enum msm_display_caps {
+	MSM_DISPLAY_CAP_VID_MODE	= BIT(0),
+	MSM_DISPLAY_CAP_CMD_MODE	= BIT(1),
+	MSM_DISPLAY_CAP_HOT_PLUG	= BIT(2),
+	MSM_DISPLAY_CAP_EDID		= BIT(3),
+};
+
+/**
+ * struct msm_display_info - defines display properties
+ * @intf_type:          DRM_MODE_CONNECTOR_ display type
+ * @capabilities:       Bitmask of display flags
+ * @num_of_h_tiles:     Number of horizontal tiles in case of split interface
+ * @h_tile_instance:    Controller instance used per tile. Number of elements is
+ *                      based on num_of_h_tiles
+ * @is_connected:       Set to true if display is connected
+ * @width_mm:           Physical width
+ * @height_mm:          Physical height
+ * @max_width:          Max width of display. In case of hot pluggable display
+ *                      this is max width supported by controller
+ * @max_height:         Max height of display. In case of hot pluggable display
+ *                      this is max height supported by controller
+ * @compression:        Compression supported by the display
+ * @display_id:         Display ID such as primary, secondary, etc.
+ */
+struct msm_display_info {
+	int intf_type;
+	uint32_t capabilities;
+
+	uint32_t num_of_h_tiles;
+	uint32_t h_tile_instance[MAX_H_TILES_PER_DISPLAY];
+
+	bool is_connected;
+
+	unsigned int width_mm;
+	unsigned int height_mm;
+
+	uint32_t max_width;
+	uint32_t max_height;
+
+	enum msm_display_compression compression;
+
+	enum msm_mdp_display_id display_id;
+};
+
+struct display_manager;
+
+/* Commit thread specific structure */
+struct msm_drm_commit {
+	struct drm_device *dev;
+	struct task_struct *thread;
+	unsigned int crtc_id;
+	struct kthread_worker worker;
 };
 
 struct msm_drm_private {
@@ -103,6 +244,9 @@ struct msm_drm_private {
 
 	/* DSI is shared by mdp4 and mdp5 */
 	struct msm_dsi *dsi[2];
+
+	/* Display manager for SDE driver */
+	struct display_manager *dm;
 
 	/* when we have more than one 'msm_gpu' these need to be an array: */
 	struct msm_gpu *gpu;
@@ -138,6 +282,8 @@ struct msm_drm_private {
 	unsigned int num_crtcs;
 	struct drm_crtc *crtcs[MAX_CRTCS];
 
+	struct msm_drm_commit disp_thread[MAX_CRTCS];
+
 	unsigned int num_encoders;
 	struct drm_encoder *encoders[MAX_ENCODERS];
 
@@ -148,7 +294,9 @@ struct msm_drm_private {
 	struct drm_connector *connectors[MAX_CONNECTORS];
 
 	/* Properties */
-	struct drm_property *plane_property[PLANE_PROP_MAX_NUM];
+	struct drm_property *plane_property[PLANE_PROP_COUNT];
+	struct drm_property *crtc_property[CRTC_PROP_COUNT];
+	struct drm_property *conn_property[CONNECTOR_PROP_COUNT];
 
 	/* VRAM carveout, used when no IOMMU: */
 	struct {
@@ -161,7 +309,25 @@ struct msm_drm_private {
 	} vram;
 
 	struct msm_vblank_ctrl vblank_ctrl;
+
+	struct msm_evtlog evtlog;
+#ifdef MSM_FORCE_SUBMIT
+	bool force_submit;
+#endif
 };
+
+/* Helper macro for accessing msm_drm_private's event log */
+#define MSM_EVTMSG(dev, msg, x, y)  do {                                       \
+		if ((dev) && ((struct drm_device *)(dev))->dev_private)        \
+			msm_evtlog_sample(&((struct msm_drm_private *)         \
+					((struct drm_device *)                 \
+					(dev))->dev_private)->evtlog, __func__,\
+					(msg), (uint64_t)(x), (uint64_t)(y),   \
+					__LINE__);                             \
+	} while (0)
+
+/* Helper macro for accessing msm_drm_private's event log */
+#define MSM_EVT(dev, x, y) MSM_EVTMSG((dev), 0, (x), (y))
 
 struct msm_format {
 	uint32_t pixel_format;
@@ -181,8 +347,6 @@ void __msm_fence_worker(struct work_struct *work);
 		(_cb)->func = _func;                         \
 	} while (0)
 
-int msm_atomic_check(struct drm_device *dev,
-		     struct drm_atomic_state *state);
 int msm_atomic_commit(struct drm_device *dev,
 		struct drm_atomic_state *state, bool async);
 
@@ -325,6 +489,23 @@ static inline int align_pitch(int width, int bpp)
 	return bytespp * ALIGN(width, 32);
 }
 
+static inline enum msm_mdp_display_id msm_get_display_id(
+	const char *display_type)
+{
+	if (!display_type)
+		return DISPLAY_ID_NONE;
+	else if (!strcmp(display_type, "primary"))
+		return DISPLAY_ID_PRIMARY;
+	else if (!strcmp(display_type, "secondary"))
+		return DISPLAY_ID_SECONDARY;
+	else if (!strcmp(display_type, "tertiary"))
+		return DISPLAY_ID_TERTIARY;
+	else if (!strcmp(display_type, "quaternary"))
+		return DISPLAY_ID_QUATERNARY;
+	else
+		return DISPLAY_ID_NONE;
+};
+
 /* for the generated headers: */
 #define INVALID_IDX(idx) ({BUG(); 0;})
 #define fui(x)                ({BUG(); 0;})
@@ -335,6 +516,5 @@ static inline int align_pitch(int width, int bpp)
 
 /* for conditionally setting boolean flag(s): */
 #define COND(bool, val) ((bool) ? (val) : 0)
-
 
 #endif /* __MSM_DRV_H__ */

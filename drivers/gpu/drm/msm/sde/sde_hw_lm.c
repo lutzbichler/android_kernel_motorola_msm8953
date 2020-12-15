@@ -37,6 +37,7 @@ static struct sde_lm_cfg *_lm_offset(enum sde_lm mixer,
 			b->base_off = addr;
 			b->blk_off = m->mixer[i].base;
 			b->hwversion = m->hwversion;
+			b->log_mask = SDE_DBG_MASK_LM;
 			return &m->mixer[i];
 		}
 	}
@@ -53,14 +54,16 @@ static struct sde_lm_cfg *_lm_offset(enum sde_lm mixer,
 static inline int _stage_offset(struct sde_hw_mixer *ctx, enum sde_stage stage)
 {
 	const struct sde_lm_sub_blks *sblk = ctx->cap->sblk;
+	int rc;
 
-	if (WARN_ON(stage == SDE_STAGE_BASE))
-		return -EINVAL;
-
-	if ((stage - SDE_STAGE_0) <= sblk->maxblendstages)
-		return sblk->blendstage_base[stage];
+	if (stage == SDE_STAGE_BASE)
+		rc = -EINVAL;
+	else if (stage <= sblk->maxblendstages)
+		rc = sblk->blendstage_base[stage - 1];
 	else
-		return -EINVAL;
+		rc = -EINVAL;
+
+	return rc;
 }
 
 static void sde_hw_lm_setup_out(struct sde_hw_mixer *ctx,
@@ -76,7 +79,7 @@ static void sde_hw_lm_setup_out(struct sde_hw_mixer *ctx,
 	SDE_REG_WRITE(c, LM_OUT_SIZE, outsize);
 
 	/* SPLIT_LEFT_RIGHT */
-	opmode = (opmode & ~(1 << 31)) | (mixer->right_mixer & 1 << 31);
+	opmode = (opmode & ~(1 << 31)) | ((mixer->right_mixer) ? (1 << 31) : 0);
 	SDE_REG_WRITE(c, LM_OP_MODE, opmode);
 }
 
@@ -105,6 +108,9 @@ static void sde_hw_lm_setup_blendcfg(struct sde_hw_mixer *ctx,
 	struct sde_hw_alpha_cfg *fg, *bg;
 	int stage_off;
 
+	if (stage == SDE_STAGE_BASE)
+		return;
+
 	stage_off = _stage_offset(ctx, stage);
 	if (WARN_ON(stage_off < 0))
 		return;
@@ -120,15 +126,13 @@ static void sde_hw_lm_setup_blendcfg(struct sde_hw_mixer *ctx,
 
 	/* bg */
 	blend_op |= (bg->alpha_sel & 3) << 8;
-	blend_op |= (bg->inv_alpha_sel & 1) << 2;
-	blend_op |= (bg->mod_alpha & 1) << 3;
-	blend_op |= (bg->inv_mode_alpha & 1) << 4;
+	blend_op |= (bg->inv_alpha_sel & 1) << 10;
+	blend_op |= (bg->mod_alpha & 1) << 11;
+	blend_op |= (bg->inv_mode_alpha & 1) << 12;
 
-	SDE_REG_WRITE(c, LM_BLEND0_FG_ALPHA + stage_off,
-			fg->const_alpha);
-	SDE_REG_WRITE(c, LM_BLEND0_FG_ALPHA + stage_off,
-			bg->const_alpha);
-	SDE_REG_WRITE(c, LM_OP_MODE, blend_op);
+	SDE_REG_WRITE(c, LM_BLEND0_FG_ALPHA + stage_off, fg->const_alpha);
+	SDE_REG_WRITE(c, LM_BLEND0_BG_ALPHA + stage_off, bg->const_alpha);
+	SDE_REG_WRITE(c, LM_BLEND0_OP + stage_off, blend_op);
 }
 
 static void sde_hw_lm_setup_color3(struct sde_hw_mixer *ctx,
@@ -142,8 +146,8 @@ static void sde_hw_lm_setup_color3(struct sde_hw_mixer *ctx,
 	/* read the existing op_mode configuration */
 	op_mode = SDE_REG_READ(c, LM_OP_MODE);
 
-	for (i = 0; i < maxblendstages; i++)
-		op_mode |= ((cfg->keep_fg[i]  & 0x1) << i);
+	for (i = SDE_STAGE_0; i <= maxblendstages; i++)
+		op_mode |= (cfg->keep_fg[i]) ? (1 << i) : 0;
 
 	SDE_REG_WRITE(c, LM_OP_MODE, op_mode);
 }
@@ -189,4 +193,9 @@ struct sde_hw_mixer *sde_hw_lm_init(enum sde_lm idx,
 	 * Perform any default initialization for the sspp blocks
 	 */
 	return c;
+}
+
+void sde_hw_lm_destroy(struct sde_hw_mixer *lm)
+{
+	kfree(lm);
 }

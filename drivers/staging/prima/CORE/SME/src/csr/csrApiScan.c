@@ -479,7 +479,7 @@ eHalStatus csrQueueScanRequest( tpAniSirGlobal pMac, tSmeCmd *pScanCmd )
             pChnInfo->numOfChannels = pScanCmd->u.scanCmd.u.scanRequest.ChannelInfo.numOfChannels - nNumChanCombinedConc;
 
             VOS_TRACE(VOS_MODULE_ID_SME, VOS_TRACE_LEVEL_WARN,
-                    FL(" &channelToScan %p pScanCmd(%p) pScanCmd->u.scanCmd.u.scanRequest.ChannelInfo.ChannelList(%p)numChn(%d)"),
+                    FL(" &channelToScan %pK pScanCmd(%pK) pScanCmd->u.scanCmd.u.scanRequest.ChannelInfo.ChannelList(%pK)numChn(%d)"),
                     &channelToScan[0], pScanCmd,
                     pScanCmd->u.scanCmd.u.scanRequest.ChannelInfo.ChannelList, numChn);
 
@@ -1728,13 +1728,8 @@ eHalStatus csrScanHandleSearchForSSID(tpAniSirGlobal pMac, tSmeCmd *pCommand)
             smsLog(pMac, LOGE, FL("session %d not found"), sessionId);
             break;
         }
-        /* If Disconnect is already issued from HDD no need to issue connect
-         * pSession->abortConnection will not be set in case of try
-         * disconnect or hdd stop adaptor use connectState for these cases.
-         */
-        if (pSession->abortConnection ||
-            (pMac->roam.roamSession[sessionId].connectState ==
-            eCSR_ASSOC_STATE_TYPE_INFRA_DISCONNECTING))
+        /* If Disconnect is already issued from HDD no need to issue connect */
+        if (pSession->abortConnection)
         {
            smsLog(pMac, LOGE,
               FL("Disconnect in progress, no need to issue connect"));
@@ -3402,6 +3397,10 @@ tANI_BOOLEAN csrRemoveDupBssDescription( tpAniSirGlobal pMac, tSirBssDescription
 
     tCsrScanResult *pBssDesc;
     tANI_BOOLEAN fRC = FALSE;
+    tDot11fBeaconIEs *temp_ie = pIes;
+
+    if (!temp_ie)
+        csrGetParsedBssDescriptionIEs(pMac, pSirBssDescr, &temp_ie);
 
     // Walk through all the chained BssDescriptions.  If we find a chained BssDescription that
     // matches the BssID of the BssDescription passed in, then these must be duplicate scan
@@ -3414,9 +3413,36 @@ tANI_BOOLEAN csrRemoveDupBssDescription( tpAniSirGlobal pMac, tSirBssDescription
 
         // we have a duplicate scan results only when BSSID, SSID, Channel and NetworkType
         // matches
-        if ( csrIsDuplicateBssDescription( pMac, &pBssDesc->Result.BssDescriptor, 
-                                                        pSirBssDescr, pIes, fForced ) )
+        if (csrIsDuplicateBssDescription(pMac, &pBssDesc->Result.BssDescriptor,
+                                          pSirBssDescr, temp_ie, fForced))
         {
+            /*
+             * Due to Rx sensitivity issue, sometime beacons are seen on
+             * adjacent channel so workaround in software is needed. If DS
+             * params or HT info are present driver can get proper channel
+             * info from these IEs and the older RSSI values are used in new
+             * entry.
+             *
+             * For the cases where DS params and HT info is not present,
+             * driver needs to check below conditions to update proper
+             * channel so that the older RSSI and channel values are used in
+             * new entry:
+             *  -- The old entry channel and new entry channel are not same
+             *  -- RSSI is below 15db or more from old value, this indicate
+             *     that the signal has leaked in adjacent channel
+             */
+            if (!pSirBssDescr->fProbeRsp &&
+                (temp_ie && !temp_ie->DSParams.present &&
+                !temp_ie->HTInfo.present) &&
+                (pSirBssDescr->channelId !=
+                 pBssDesc->Result.BssDescriptor.channelId) &&
+                ((pBssDesc->Result.BssDescriptor.rssi - pSirBssDescr->rssi) >
+                 SIR_ADJACENT_CHANNEL_RSSI_DIFF_THRESHOLD)) {
+                 pSirBssDescr->channelId =
+                            pBssDesc->Result.BssDescriptor.channelId;
+                pSirBssDescr->rssi =
+                                 pBssDesc->Result.BssDescriptor.rssi;
+            }
             pSirBssDescr->rssi = (tANI_S8)( (((tANI_S32)pSirBssDescr->rssi * CSR_SCAN_RESULT_RSSI_WEIGHT ) +
                                              ((tANI_S32)pBssDesc->Result.BssDescriptor.rssi * (100 - CSR_SCAN_RESULT_RSSI_WEIGHT) )) / 100 );
             // Remove the 'old' entry from the list....
@@ -3442,6 +3468,9 @@ tANI_BOOLEAN csrRemoveDupBssDescription( tpAniSirGlobal pMac, tSirBssDescription
 
         pEntry = csrLLNext( &pMac->scan.scanResultList, pEntry, LL_ACCESS_LOCK );
     }
+
+    if (!pIes && temp_ie)
+       vos_mem_free(temp_ie);
 
     return fRC;
 }
@@ -4142,6 +4171,31 @@ void csrApplyChannelPowerCountryInfo( tpAniSirGlobal pMac, tCsrChannel *pChannel
         smsLog( pMac, LOGE, FL("  11D channel list is empty"));
     }
     csrSetCfgCountryCode(pMac, countryCode);
+}
+
+void csrUpdateFCCChannelList(tpAniSirGlobal pMac)
+{
+    tCsrChannel ChannelList;
+    tANI_U8 chnlIndx = 0;
+    int i;
+
+    for ( i = 0; i < pMac->scan.base20MHzChannels.numChannels; i++ )
+    {
+        if (pMac->scan.fcc_constraint &&
+            ((pMac->scan.base20MHzChannels.channelList[i] == 12) ||
+            (pMac->scan.base20MHzChannels.channelList[i] == 13)))
+        {
+                    VOS_TRACE(VOS_MODULE_ID_SME, VOS_TRACE_LEVEL_INFO,
+                        FL("removing channel %d"),
+                        pMac->scan.base20MHzChannels.channelList[i]);
+            continue;
+        }
+        ChannelList.channelList[chnlIndx] =
+        pMac->scan.base20MHzChannels.channelList[i];
+        chnlIndx++;
+    }
+    csrSetCfgValidChannelList(pMac, ChannelList.channelList, chnlIndx);
+    csrScanFilterResults(pMac);
 }
 
 void csrResetCountryInformation( tpAniSirGlobal pMac, tANI_BOOLEAN fForce, tANI_BOOLEAN updateRiva )
@@ -5303,13 +5357,16 @@ tANI_BOOLEAN csrScanComplete( tpAniSirGlobal pMac, tSirSmeScanRsp *pScanRsp )
 }
 
 
-
 static void csrScanRemoveDupBssDescriptionFromInterimList( tpAniSirGlobal pMac, 
                                                            tSirBssDescription *pSirBssDescr,
                                                            tDot11fBeaconIEs *pIes)
 {
     tListElem *pEntry;
     tCsrScanResult *pCsrBssDescription;
+    tDot11fBeaconIEs *temp_ie = pIes;
+
+    if (!temp_ie)
+        csrGetParsedBssDescriptionIEs(pMac, pSirBssDescr, &temp_ie);
 
     // Walk through all the chained BssDescriptions.  If we find a chained BssDescription that
     // matches the BssID of the BssDescription passed in, then these must be duplicate scan
@@ -5322,9 +5379,39 @@ static void csrScanRemoveDupBssDescriptionFromInterimList( tpAniSirGlobal pMac,
         // we have a duplicate scan results only when BSSID, SSID, Channel and NetworkType
         // matches
 
-        if ( csrIsDuplicateBssDescription( pMac, &pCsrBssDescription->Result.BssDescriptor, 
-                                             pSirBssDescr, pIes, FALSE ) )
+        if (csrIsDuplicateBssDescription(pMac,
+                                     &pCsrBssDescription->Result.BssDescriptor,
+                                     pSirBssDescr, temp_ie, FALSE))
         {
+            /*
+             * Due to Rx sensitivity issue, sometime beacons are seen on
+             * adjacent channel so workaround in software is needed. If DS
+             * params or HT info are present driver can get proper channel
+             * info from these IEs and the older RSSI values are used in new
+             * entry.
+             *
+             * For the cases where DS params and HT info is not present,
+             * driver needs to check below conditions to update proper
+             * channel so that the older RSSI and channel values are used in
+             * new entry:
+             *  -- The old entry channel and new entry channel are not same
+             *  -- RSSI is below 15db or more from old value, this indicate
+             *     that the signal has leaked in adjacent channel
+             */
+            if (!pSirBssDescr->fProbeRsp &&
+                (temp_ie && !temp_ie->DSParams.present &&
+                !temp_ie->HTInfo.present) &&
+                (pSirBssDescr->channelId !=
+                 pCsrBssDescription->Result.BssDescriptor.channelId) &&
+                ((pCsrBssDescription->Result.BssDescriptor.rssi -
+                  pSirBssDescr->rssi) >
+                 SIR_ADJACENT_CHANNEL_RSSI_DIFF_THRESHOLD)) {
+                 pSirBssDescr->channelId =
+                            pCsrBssDescription->Result.BssDescriptor.channelId;
+                pSirBssDescr->rssi =
+                                 pCsrBssDescription->Result.BssDescriptor.rssi;
+            }
+
             pSirBssDescr->rssi = (tANI_S8)( (((tANI_S32)pSirBssDescr->rssi * CSR_SCAN_RESULT_RSSI_WEIGHT ) +
                                     ((tANI_S32)pCsrBssDescription->Result.BssDescriptor.rssi * (100 - CSR_SCAN_RESULT_RSSI_WEIGHT) )) / 100 );
 
@@ -5342,6 +5429,9 @@ static void csrScanRemoveDupBssDescriptionFromInterimList( tpAniSirGlobal pMac,
 
         pEntry = csrLLNext( &pMac->scan.tempScanResults, pEntry, LL_ACCESS_LOCK );
     }
+
+    if (!pIes && temp_ie)
+       vos_mem_free(temp_ie);
 }
 
 
@@ -9216,6 +9306,25 @@ eHalStatus csrScanSavePreferredNetworkFound(tpAniSirGlobal pMac,
    pBssDescr->capabilityInfo = *((tANI_U16 *)&pParsedFrame->capabilityInfo);
    vos_mem_copy((tANI_U8 *) &pBssDescr->bssId, (tANI_U8 *) macHeader->bssId, sizeof(tSirMacAddr));
    pBssDescr->nReceivedTime = vos_timer_get_system_time();
+
+#ifdef WLAN_FEATURE_VOWIFI_11R
+    // MobilityDomain
+    pBssDescr->mdie[0] = 0;
+    pBssDescr->mdie[1] = 0;
+    pBssDescr->mdie[2] = 0;
+    pBssDescr->mdiePresent = FALSE;
+    // If mdie is present in the probe resp we fill it in the bss description
+    if(pParsedFrame->mdiePresent)
+    {
+        pBssDescr->mdiePresent = TRUE;
+        pBssDescr->mdie[0] = pParsedFrame->mdie[0];
+        pBssDescr->mdie[1] = pParsedFrame->mdie[1];
+        pBssDescr->mdie[2] = pParsedFrame->mdie[2];
+    }
+    smsLog(pMac, LOG1, FL("mdie=%02x%02x%02x"),
+           (unsigned int)pBssDescr->mdie[0], (unsigned int)pBssDescr->mdie[1],
+           (unsigned int)pBssDescr->mdie[2]);
+#endif
 
    smsLog( pMac, LOG1, FL("Bssid= "MAC_ADDRESS_STR
                        " chan= %d, rssi = %d "),

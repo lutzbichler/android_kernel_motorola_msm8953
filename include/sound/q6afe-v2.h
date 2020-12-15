@@ -173,6 +173,7 @@ enum {
 	IDX_AFE_PORT_ID_QUATERNARY_TDM_TX_6,
 	IDX_AFE_PORT_ID_QUATERNARY_TDM_RX_7,
 	IDX_AFE_PORT_ID_QUATERNARY_TDM_TX_7,
+	IDX_AFE_LOOPBACK_TX,
 	AFE_MAX_PORTS
 };
 
@@ -187,6 +188,11 @@ enum afe_mad_type {
 enum afe_cal_mode {
 	AFE_CAL_MODE_DEFAULT = 0x00,
 	AFE_CAL_MODE_NONE,
+};
+
+enum lpass_clk_ver {
+	LPASS_CLK_VER_1,
+	LPASS_CLK_VER_2,
 };
 
 struct afe_audio_buffer {
@@ -234,6 +240,7 @@ struct aanc_data {
 
 int afe_open(u16 port_id, union afe_port_config *afe_config, int rate);
 int afe_close(int port_id);
+enum lpass_clk_ver afe_get_lpass_clk_ver(void);
 int afe_loopback(u16 enable, u16 rx_port, u16 tx_port);
 int afe_sidetone_enable(u16 tx_port_id, u16 rx_port_id,  bool enable);
 int afe_loopback_gain(u16 port_id, u16 volume);
@@ -335,5 +342,10 @@ int afe_tdm_port_start(u16 port_id, struct afe_tdm_port_config *tdm_port,
 int ospl2xx_afe_set_callback(int32_t (*ospl2xx_callback_func)
 				(struct apr_client_data *data));
 int ospl2xx_afe_apr_send_pkt(void *data, int index);
+#endif
+#ifdef CONFIG_SND_SOC_TAS2560
+int tas2560_algo_afe_set_callback(int32_t (*tas2560_algo_callback_func)
+				(struct apr_client_data *data));
+int tas2560_algo_afe_apr_send_pkt(void *data, int index);
 #endif
 #endif /* __Q6AFE_V2_H__ */

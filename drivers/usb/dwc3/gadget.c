@@ -183,90 +183,65 @@ int dwc3_gadget_set_link_state(struct dwc3 *dwc, enum dwc3_link_state state)
  *
  * Unfortunately, due to many variables that's not always the case.
  */
-int dwc3_gadget_resize_tx_fifos(struct dwc3 *dwc)
+int dwc3_gadget_resize_tx_fifos(struct dwc3 *dwc, struct dwc3_ep *dep)
 {
-	int		last_fifo_depth = 0;
-	int		ram1_depth;
-	int		fifo_size;
-	int		mdwidth;
-	int		num;
-	int		num_eps;
-	int		max_packet = 1024;
-	struct usb_composite_dev *cdev = get_gadget_data(&dwc->gadget);
+	int		fifo_size, mdwidth, max_packet = 1024;
+	int		tmp, mult = 1;
 
-	if (!(cdev && cdev->config) || !dwc->needs_fifo_resize)
+	if (!dwc->needs_fifo_resize)
 		return 0;
 
-	num_eps = dwc->num_in_eps;
-	ram1_depth = DWC3_RAM1_DEPTH(dwc->hwparams.hwparams7);
-	mdwidth = DWC3_MDWIDTH(dwc->hwparams.hwparams0);
+	/* resize IN endpoints excepts ep0 */
+	if (!usb_endpoint_dir_in(dep->endpoint.desc) ||
+			dep->endpoint.ep_num == 0)
+		return 0;
 
-	/* MDWIDTH is represented in bits, we need it in bytes */
-	mdwidth >>= 3;
-	last_fifo_depth = (dwc3_readl(dwc->regs, DWC3_GTXFIFOSIZ(0)) & 0xFFFF);
-	dev_dbg(dwc->dev, "%s: num eps:%d max_packet:%d last_fifo_depth:%04x\n",
-				__func__, num_eps, max_packet, last_fifo_depth);
-
-	/* Don't resize ep0IN TxFIFO, start with ep1IN only. */
-	for (num = 1; num < num_eps; num++) {
-		/* bit0 indicates direction; 1 means IN ep */
-		struct dwc3_ep	*dep = dwc->eps[(num << 1) | 1];
-		int		mult = 1;
-		int		tmp;
-
-		tmp = max_packet + mdwidth;
-		/*
-		 * Interfaces like MBIM or ECM is having multiple data
-		 * interfaces. SET_CONFIG() happens before set_alt with
-		 * data interface 1 which results into calling this API
-		 * before GSI endpoint enabled. This results no txfifo
-		 * resize with GSI endpoint causing low throughput. Hence
-		 * use mult as 3 for GSI IN endpoint always irrespective
-		 * USB speed.
-		 */
-		if (dep->endpoint.ep_type == EP_TYPE_GSI)
-			mult = 3;
-
-		if (num == high_bw_ep_in_num)
-			mult = 3;
-
-		if (!(dep->flags & DWC3_EP_ENABLED)) {
-			dev_dbg(dwc->dev, "ep%dIn not enabled", num);
-			goto resize_fifo;
-		}
-
-		if (((dep->endpoint.maxburst > 1) &&
-				usb_endpoint_xfer_bulk(dep->endpoint.desc))
-				|| usb_endpoint_xfer_isoc(dep->endpoint.desc))
-			mult = 3;
-
-resize_fifo:
-		tmp *= mult;
-		tmp += mdwidth;
-
-		fifo_size = DIV_ROUND_UP(tmp, mdwidth);
-
-		fifo_size |= (last_fifo_depth << 16);
-
-		dev_dbg(dwc->dev, "%s: Fifo Addr %04x Size %d\n",
-				dep->name, last_fifo_depth, fifo_size & 0xffff);
-
-		last_fifo_depth += (fifo_size & 0xffff);
-		if (dwc->tx_fifo_size &&
-				(last_fifo_depth >= dwc->tx_fifo_size)) {
-			/*
-			 * Fifo size allocated exceeded available RAM size.
-			 * Hence return error.
-			 */
-			dev_err(dwc->dev, "Fifosize(%d) > available RAM(%d)\n",
-					last_fifo_depth, dwc->tx_fifo_size);
-			return -ENOMEM;
-		}
-
-		dwc3_writel(dwc->regs, DWC3_GTXFIFOSIZ(num), fifo_size);
-
+	/* Don't resize already resized IN endpoint */
+	if (dep->fifo_depth) {
+		dev_dbg(dwc->dev, "%s fifo_depth:%d is already set\n",
+				dep->endpoint.name, dep->fifo_depth);
+		return 0;
 	}
 
+	mdwidth = DWC3_MDWIDTH(dwc->hwparams.hwparams0);
+	/* MDWIDTH is represented in bits, we need it in bytes */
+	mdwidth >>= 3;
+
+	if (dep->endpoint.ep_type == EP_TYPE_GSI || dep->endpoint.endless)
+		mult = 3;
+
+	if (((dep->endpoint.maxburst > 1) &&
+			usb_endpoint_xfer_bulk(dep->endpoint.desc))
+			|| usb_endpoint_xfer_isoc(dep->endpoint.desc))
+		mult = 3;
+
+	tmp = ((max_packet + mdwidth) * mult) + mdwidth;
+	fifo_size = DIV_ROUND_UP(tmp, mdwidth);
+	dep->fifo_depth = fifo_size;
+	fifo_size |= (dwc3_readl(dwc->regs, DWC3_GTXFIFOSIZ(0)) & 0xffff0000)
+						+ (dwc->last_fifo_depth << 16);
+	dwc->last_fifo_depth += (fifo_size & 0xffff);
+
+	dev_dbg(dwc->dev, "%s ep_num:%d last_fifo_depth:%04x fifo_depth:%d\n",
+		dep->endpoint.name, dep->endpoint.ep_num, dwc->last_fifo_depth,
+		dep->fifo_depth);
+
+	dbg_event(dwc->ctrl_num, 0xFF, "resize_fifo", dep->number);
+	dbg_event(dwc->ctrl_num, 0xFF, "fifo_depth", dep->fifo_depth);
+	/* Check fifo size allocation doesn't exceed available RAM size. */
+	if (dwc->tx_fifo_size &&
+		((dwc->last_fifo_depth * mdwidth) >= dwc->tx_fifo_size)) {
+		dev_err(dwc->dev, "Fifosize(%d) > RAM size(%d) %s depth:%d\n",
+			(dwc->last_fifo_depth * mdwidth), dwc->tx_fifo_size,
+			dep->endpoint.name, fifo_size);
+		dwc->last_fifo_depth -= (fifo_size & 0xffff);
+		dep->fifo_depth = 0;
+		WARN_ON(1);
+		return -ENOMEM;
+	}
+
+	dwc3_writel(dwc->regs, DWC3_GTXFIFOSIZ(dep->endpoint.ep_num),
+							fifo_size);
 	return 0;
 }
 
@@ -441,7 +416,16 @@ static void dwc3_free_trb_pool(struct dwc3_ep *dep)
 	if (dep->endpoint.ep_type == EP_TYPE_GSI)
 		return;
 
-	if (dep->trb_pool && dep->trb_pool_dma) {
+	/*
+	 * Clean up ep ring to avoid getting xferInProgress due to stale trbs
+	 * with HWO bit set from previous composition when update transfer cmd
+	 * is issued.
+	 */
+	if (dep->number > 1 && dep->trb_pool && dep->trb_pool_dma) {
+		memset(&dep->trb_pool[0], 0,
+			sizeof(struct dwc3_trb) * dep->num_trbs);
+		dbg_event(dwc->ctrl_num, dep->number, "Clr_TRB", 0);
+
 		dma_free_coherent(dwc->dev,
 			sizeof(struct dwc3_trb) * DWC3_TRB_NUM, dep->trb_pool,
 			dep->trb_pool_dma);
@@ -617,6 +601,17 @@ static int __dwc3_gadget_ep_enable(struct dwc3_ep *dep,
 	dev_vdbg(dwc->dev, "Enabling %s\n", dep->name);
 
 	if (!(dep->flags & DWC3_EP_ENABLED)) {
+		dep->endpoint.desc = desc;
+		dep->comp_desc = comp_desc;
+		dep->type = usb_endpoint_type(desc);
+		ret = dwc3_gadget_resize_tx_fifos(dwc, dep);
+		if (ret) {
+			dep->endpoint.desc = NULL;
+			dep->comp_desc = NULL;
+			dep->type = 0;
+			return ret;
+		}
+
 		ret = dwc3_gadget_start_config(dwc, dep);
 		if (ret) {
 			dev_err(dwc->dev, "start_config() failed for %s\n",
@@ -636,9 +631,6 @@ static int __dwc3_gadget_ep_enable(struct dwc3_ep *dep,
 		struct dwc3_trb	*trb_st_hw;
 		struct dwc3_trb	*trb_link;
 
-		dep->endpoint.desc = desc;
-		dep->comp_desc = comp_desc;
-		dep->type = usb_endpoint_type(desc);
 		dep->flags |= DWC3_EP_ENABLED;
 
 		reg = dwc3_readl(dwc->regs, DWC3_DALEPENA);
@@ -676,7 +668,9 @@ static void dwc3_remove_requests(struct dwc3 *dwc, struct dwc3_ep *dep)
 
 			dwc3_gadget_giveback(dep, req, -ESHUTDOWN);
 		}
-	} else if (usb_endpoint_xfer_isoc(dep->endpoint.desc)) {
+	/* For isoc endpoints explicitly stop active transfers */
+	} else if (dep->endpoint.desc &&
+		usb_endpoint_xfer_isoc(dep->endpoint.desc)) {
 		dwc3_stop_active_transfer(dwc, dep->number, true);
 	}
 
@@ -718,17 +712,6 @@ static int __dwc3_gadget_ep_disable(struct dwc3_ep *dep)
 	dep->comp_desc = NULL;
 	dep->type = 0;
 	dep->flags = 0;
-
-	/*
-	 * Clean up ep ring to avoid getting xferInProgress due to stale trbs
-	 * with HWO bit set from previous composition when update transfer cmd
-	 * is issued.
-	 */
-	if (dep->number > 1 && dep->trb_pool) {
-		memset(&dep->trb_pool[0], 0,
-			sizeof(struct dwc3_trb) * dep->num_trbs);
-		dbg_event(dwc->ctrl_num, dep->number, "Clr_TRB", 0);
-	}
 
 	return 0;
 }
@@ -1480,13 +1463,6 @@ static int dwc3_gadget_wakeup(struct usb_gadget *g)
 	return 0;
 }
 
-static inline enum dwc3_link_state dwc3_get_link_state(struct dwc3 *dwc)
-{
-	u32 reg;
-	reg = dwc3_readl(dwc->regs, DWC3_DSTS);
-	return DWC3_DSTS_USBLNKST(reg);
-}
-
 static bool dwc3_gadget_is_suspended(struct dwc3 *dwc)
 {
 	if (atomic_read(&dwc->in_lpm) ||
@@ -1915,19 +1891,21 @@ static int dwc_gadget_func_wakeup(struct usb_gadget *g, int interface_id)
 		return -EAGAIN;
 	}
 
-	if (dwc->revision < DWC3_REVISION_220A) {
-		ret = dwc3_send_gadget_generic_command(dwc,
-			DWC3_DGCMD_XMIT_FUNCTION, interface_id);
-	} else {
-		ret = dwc3_send_gadget_generic_command(dwc,
-			DWC3_DGCMD_XMIT_DEV, 0x1 | (interface_id << 4));
+	/*
+	 * Return -EAGAIN on sending function wakeup command successfully
+	 * as function driver needs to wait for bus resume before queueing
+	 * any USB request. USB function driver which supports function
+	 * wakeup functionality should check return value and handle it.
+	 */
+	ret = dwc3_send_gadget_generic_command(dwc, DWC3_DGCMD_XMIT_DEV,
+			0x1 | (interface_id << 4));
+	if (!ret) {
+		pr_debug("Function wakeup HW command succeeded.\n");
+		ret = -EAGAIN;
+		return ret;
 	}
 
-	if (ret)
-		pr_err("Function wakeup HW command failed.\n");
-	else
-		pr_debug("Function wakeup HW command succeeded.\n");
-
+	pr_err("Function wakeup HW command failed.\n");
 	return ret;
 }
 
@@ -2326,8 +2304,6 @@ static int dwc3_gadget_stop(struct usb_gadget *g,
 
 	dwc3_gadget_disable_irq(dwc);
 
-	tasklet_kill(&dwc->bh);
-
 	spin_lock_irqsave(&dwc->lock, flags);
 
 	__dwc3_gadget_ep_disable(dwc->eps[0]);
@@ -2492,28 +2468,14 @@ static void dwc3_gadget_free_endpoints(struct dwc3 *dwc)
 /* -------------------------------------------------------------------------- */
 
 static int __dwc3_cleanup_done_trbs(struct dwc3 *dwc, struct dwc3_ep *dep,
-		struct dwc3_request *req, struct dwc3_trb *trb,
-		const struct dwc3_event_depevt *event, int status,
-		int chain)
+		struct dwc3_request *req, struct dwc3_trb *trb, unsigned length,
+		const struct dwc3_event_depevt *event, int status)
 {
 	unsigned int		count;
 	unsigned int		s_pkt = 0;
 	unsigned int		trb_status;
 
 	trace_dwc3_complete_trb(dep, trb);
-
-	/*
-	 * If we're in the middle of series of chained TRBs and we
-	 * receive a short transfer along the way, DWC3 will skip
-	 * through all TRBs including the last TRB in the chain (the
-	 * where CHN bit is zero. DWC3 will also avoid clearing HWO
-	 * bit and SW has to do it manually.
-	 *
-	 * We're going to do that here to avoid problems of HW trying
-	 * to use bogus TRBs for transfers.
-	 */
-	if (chain && (trb->ctrl & DWC3_TRB_CTRL_HWO))
-		trb->ctrl &= ~DWC3_TRB_CTRL_HWO;
 
 	if ((trb->ctrl & DWC3_TRB_CTRL_HWO) && status != -ESHUTDOWN)
 		/*
@@ -2526,7 +2488,6 @@ static int __dwc3_cleanup_done_trbs(struct dwc3 *dwc, struct dwc3_ep *dep,
 		 */
 		dev_err(dwc->dev, "%s's TRB (%pK) still owned by HW\n",
 				dep->name, trb);
-
 	count = trb->size & DWC3_TRB_SIZE_MASK;
 
 	if (dep->direction) {
@@ -2566,7 +2527,15 @@ static int __dwc3_cleanup_done_trbs(struct dwc3 *dwc, struct dwc3_ep *dep,
 			s_pkt = 1;
 	}
 
-	if (s_pkt && !chain)
+	/*
+	 * We assume here we will always receive the entire data block
+	 * which we should receive. Meaning, if we program RX to
+	 * receive 4K but we receive only 2K, we assume that's all we
+	 * should receive and we simply bounce the request back to the
+	 * gadget driver for further processing.
+	 */
+	req->request.actual += length - count;
+	if (s_pkt)
 		return 1;
 	if ((event->status & DEPEVT_STATUS_LST) &&
 			(trb->ctrl & (DWC3_TRB_CTRL_LST |
@@ -2586,12 +2555,9 @@ static int dwc3_cleanup_done_reqs(struct dwc3 *dwc, struct dwc3_ep *dep,
 	unsigned int		slot;
 	unsigned int		i;
 	unsigned int		trb_len;
-	int			count = 0;
 	int			ret;
 
 	do {
-		int chain;
-
 		req = next_request(&dep->req_queued);
 		if (!req) {
 			dev_err(dwc->dev, "%s: evt sts %x for no req queued",
@@ -2603,7 +2569,6 @@ static int dwc3_cleanup_done_reqs(struct dwc3 *dwc, struct dwc3_ep *dep,
 		if (req->trb->ctrl & DWC3_TRB_CTRL_HWO)
 			return 0;
 
-		chain = req->request.num_mapped_sgs > 0;
 		i = 0;
 		do {
 			slot = req->start_slot + i;
@@ -2612,8 +2577,6 @@ static int dwc3_cleanup_done_reqs(struct dwc3 *dwc, struct dwc3_ep *dep,
 				slot++;
 			slot %= DWC3_TRB_NUM;
 			trb = &dep->trb_pool[slot];
-			count += trb->size & DWC3_TRB_SIZE_MASK;
-
 
 			if (req->request.num_mapped_sgs)
 				trb_len = sg_dma_len(&req->request.sg[i]);
@@ -2621,7 +2584,7 @@ static int dwc3_cleanup_done_reqs(struct dwc3 *dwc, struct dwc3_ep *dep,
 				trb_len = req->request.length;
 
 			ret = __dwc3_cleanup_done_trbs(dwc, dep, req, trb,
-					event, status, chain);
+					trb_len, event, status);
 			if (ret)
 				break;
 		}while (++i < req->request.num_mapped_sgs);
@@ -2637,15 +2600,6 @@ static int dwc3_cleanup_done_reqs(struct dwc3 *dwc, struct dwc3_ep *dep,
 					(trb->ctrl & DWC3_TRB_CTRL_IOC))
 				ret = 1;
 		}
-
-		/*
-		 * We assume here we will always receive the entire data block
-		 * which we should receive. Meaning, if we program RX to
-		 * receive 4K but we receive only 2K, we assume that's all we
-		 * should receive and we simply bounce the request back to the
-		 * gadget driver for further processing.
-		 */
-		req->request.actual += trb_len - count;
 		dwc3_gadget_giveback(dep, req, status);
 
 		/* EP possibly disabled during giveback? */
@@ -2677,10 +2631,9 @@ static int dwc3_cleanup_done_reqs(struct dwc3 *dwc, struct dwc3_ep *dep,
 		return 1;
 	}
 
-	if (usb_endpoint_xfer_isoc(dep->endpoint.desc))
-		if ((event->status & DEPEVT_STATUS_IOC) &&
-				(trb->ctrl & DWC3_TRB_CTRL_IOC))
-			return 0;
+	if ((event->status & DEPEVT_STATUS_IOC) &&
+			(trb->ctrl & DWC3_TRB_CTRL_IOC))
+		return 0;
 	return 1;
 }
 
@@ -3075,9 +3028,6 @@ static void dwc3_gadget_reset_interrupt(struct dwc3 *dwc)
 
 	dwc3_stop_active_transfers(dwc);
 	dwc3_clear_stall_all_ep(dwc);
-
-	/* bus reset issued due to missing status stage of a control transfer */
-	dwc->resize_fifos = 0;
 
 	/* Reset device address to zero */
 	reg = dwc3_readl(dwc->regs, DWC3_DCFG);
@@ -3637,14 +3587,6 @@ static irqreturn_t dwc3_process_event_buf(struct dwc3 *dwc, u32 buf)
 	return ret;
 }
 
-static void dwc3_interrupt_bh(unsigned long param)
-{
-	struct dwc3 *dwc = (struct dwc3 *) param;
-
-	dwc3_thread_interrupt(dwc->irq, dwc);
-	enable_irq(dwc->irq);
-}
-
 static irqreturn_t dwc3_thread_interrupt(int irq, void *_dwc)
 {
 	struct dwc3 *dwc = _dwc;
@@ -3708,16 +3650,17 @@ static irqreturn_t dwc3_interrupt(int irq, void *_dwc)
 	int				i;
 	irqreturn_t			ret = IRQ_NONE;
 	unsigned			temp_cnt = 0;
+	unsigned long			flags;
 	ktime_t				start_time;
 
 	start_time = ktime_get();
-	spin_lock(&dwc->lock);
+	spin_lock_irqsave(&dwc->lock, flags);
 
 	dwc->irq_cnt++;
 
 	if (dwc->err_evt_seen) {
 		/* controller reset is still pending */
-		spin_unlock(&dwc->lock);
+		spin_unlock_irqrestore(&dwc->lock, flags);
 		return IRQ_HANDLED;
 	}
 
@@ -3731,7 +3674,7 @@ static irqreturn_t dwc3_interrupt(int irq, void *_dwc)
 		temp_cnt += dwc->ev_buffs[i]->count;
 	}
 
-	spin_unlock(&dwc->lock);
+	spin_unlock_irqrestore(&dwc->lock, flags);
 
 	dwc->irq_start_time[dwc->irq_dbg_index] = start_time;
 	dwc->irq_completion_time[dwc->irq_dbg_index] =
@@ -3739,10 +3682,8 @@ static irqreturn_t dwc3_interrupt(int irq, void *_dwc)
 	dwc->irq_event_count[dwc->irq_dbg_index] = temp_cnt / 4;
 	dwc->irq_dbg_index = (dwc->irq_dbg_index + 1) % MAX_INTR_STATS;
 
-	if (ret == IRQ_WAKE_THREAD) {
-		disable_irq_nosync(irq);
-		tasklet_schedule(&dwc->bh);
-	}
+	if (ret == IRQ_WAKE_THREAD)
+		dwc3_thread_interrupt(dwc->irq, dwc);
 
 	return IRQ_HANDLED;
 }
@@ -3790,9 +3731,6 @@ int dwc3_gadget_init(struct dwc3 *dwc)
 		goto err3;
 	}
 
-	dwc->bh.func = dwc3_interrupt_bh;
-	dwc->bh.data = (unsigned long)dwc;
-
 	dwc->gadget.ops			= &dwc3_gadget_ops;
 	dwc->gadget.max_speed		= USB_SPEED_SUPER;
 	dwc->gadget.speed		= USB_SPEED_UNKNOWN;
@@ -3809,6 +3747,9 @@ int dwc3_gadget_init(struct dwc3 *dwc)
 	 * REVISIT: Here we should clear all pending IRQs to be
 	 * sure we're starting from a well known location.
 	 */
+
+	dwc->gadget.usb_core_id = dwc->core_id;
+	dev_dbg(dwc->dev, "%s core_id : %d\n", __func__, dwc->core_id);
 
 	ret = dwc3_gadget_init_endpoints(dwc);
 	if (ret)

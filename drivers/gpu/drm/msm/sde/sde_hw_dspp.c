@@ -27,6 +27,7 @@ static struct sde_dspp_cfg *_dspp_offset(enum sde_dspp dspp,
 			b->base_off = addr;
 			b->blk_off = m->dspp[i].base;
 			b->hwversion = m->hwversion;
+			b->log_mask = SDE_DBG_MASK_DSPP;
 			return &m->dspp[i];
 		}
 	}
@@ -103,3 +104,7 @@ struct sde_hw_dspp *sde_hw_dspp_init(enum sde_dspp idx,
 	return c;
 }
 
+void sde_hw_dspp_destroy(struct sde_hw_dspp *dspp)
+{
+	kfree(dspp);
+}

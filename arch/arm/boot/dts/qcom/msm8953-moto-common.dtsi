@@ -11,9 +11,9 @@
  */
 
 #include "msm8953.dtsi"
+#include "msm-pmi8950.dtsi"
 #include "msm8953-pinctrl.dtsi"
 #include "msm8953-moto-pinctrl.dtsi"
-#include "msm-pmi8950.dtsi"
 #include "dsi-panel-mot-dummy-qhd-video.dtsi"
 #include "carrier-channel-ids.dtsi"
 #include <moto-mem-reserve.h>
@@ -69,6 +69,7 @@
 
 &soc{
 	/delete-node/ uart@78b0000;
+	/delete-node/ uart@7aef000;
 	/delete-node/ i2c@7af5000;
 	/delete-node/ spi@78b7000;
 	/delete-node/ adv_vreg;
@@ -581,7 +582,6 @@
 	muc_svc: muc_svc@0 {
 		compatible = "mmi,muc_svc";
 
-		mmi,use-authentication;
 		mmi,endo-mask = <0x4755>;
 		mmi,default-root-ver = /bits/ 8 <2>;
 	};
@@ -961,8 +961,6 @@
 	/* period below corresponds to 175 Hz */
 	qcom,wave-play-rate-us = <5714>;
 	qcom,vmax-mv = <2900>;
-	qcom,vmax-low-mv = <1160>;
-	qcom,context-haptics;
 	qcom,brake-pattern = [03 03 02 00];
 	qcom,misc-trim-error-rc19p2-clk-reg-present;
 };

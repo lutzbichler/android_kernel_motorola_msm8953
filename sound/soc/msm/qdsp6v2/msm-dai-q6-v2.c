@@ -2046,6 +2046,25 @@ static struct snd_soc_dai_driver msm_dai_q6_afe_tx_dai[] = {
 	},
 };
 
+static struct snd_soc_dai_driver msm_dai_q6_afe_lb_tx_dai[] = {
+	{
+		.capture = {
+			.stream_name = "AFE Loopback Capture",
+			.aif_name = "AFE_LOOPBACK_TX",
+			.rates = SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_8000 |
+			SNDRV_PCM_RATE_16000,
+			.formats = SNDRV_PCM_FMTBIT_S16_LE,
+			.channels_min = 1,
+			.channels_max = 8,
+			.rate_min =     8000,
+			.rate_max =	48000,
+		},
+		.id = AFE_LOOPBACK_TX,
+		.probe = msm_dai_q6_dai_probe,
+		.remove = msm_dai_q6_dai_remove,
+	},
+};
+
 static struct snd_soc_dai_driver msm_dai_q6_bt_sco_rx_dai = {
 	.playback = {
 		.stream_name = "Internal BT-SCO Playback",
@@ -3880,6 +3899,12 @@ register_slim_capture:
 			pr_err("%s: Device not found stream name %s\n",
 				__func__, stream_name);
 		break;
+	case AFE_LOOPBACK_TX:
+		rc = snd_soc_register_component(&pdev->dev,
+						&msm_dai_q6_component,
+						&msm_dai_q6_afe_lb_tx_dai[0],
+						1);
+		break;
 	case INT_BT_SCO_RX:
 		rc = snd_soc_register_component(&pdev->dev, &msm_dai_q6_component,
 		&msm_dai_q6_bt_sco_rx_dai, 1);
@@ -4219,6 +4244,16 @@ static int msm_dai_tdm_q6_probe(struct platform_device *pdev)
 	}
 	dev_dbg(&pdev->dev, "%s: Clk Rate from DT file %d\n",
 		__func__, tdm_clk_set.clk_freq_in_hz);
+
+	rc = of_property_read_u16(pdev->dev.of_node,
+		"qcom,msm-cpudai-tdm-clk-attribute",
+		&tdm_clk_set.clk_attri);
+	if (rc) {
+		dev_dbg(&pdev->dev, "%s: No Clk attribute in DT file %s\n",
+			__func__, "qcom,msm-cpudai-tdm-clk-attribute");
+	}
+	dev_dbg(&pdev->dev, "%s: Clk Attribute from DT file %d\n",
+		__func__, tdm_clk_set.clk_attri);
 
 	/* other initializations within device group */
 	group_idx = msm_dai_q6_get_group_idx(tdm_group_cfg.group_id);

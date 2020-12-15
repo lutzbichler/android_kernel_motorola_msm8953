@@ -68,41 +68,121 @@ static struct page **get_pages_vram(struct drm_gem_object *obj,
 	return p;
 }
 
+static int msm_drm_alloc_buf(struct drm_gem_object *obj)
+{
+	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+	enum dma_attr attr;
+	unsigned int nr_pages;
+	struct page **p = NULL;
+	struct drm_device *dev = obj->dev;
+	struct msm_gem_buf *buf;
+
+	if (msm_obj->buf)
+		return 0;
+
+	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
+	if (!buf) {
+		DRM_ERROR("%s: kzalloc failed\n", __func__);
+		return -ENOMEM;
+	}
+
+	init_dma_attrs(&buf->dma_attrs);
+
+	if (msm_obj->flags & MSM_BO_CONTIGUOUS)
+		dma_set_attr(DMA_ATTR_FORCE_CONTIGUOUS, &buf->dma_attrs);
+
+	if (msm_obj->flags & (MSM_BO_UNCACHED | MSM_BO_WC))
+		attr = DMA_ATTR_WRITE_COMBINE;
+	else
+		attr = DMA_ATTR_NON_CONSISTENT;
+
+	dma_set_attr(attr, &buf->dma_attrs);
+	dma_set_attr(DMA_ATTR_NO_KERNEL_MAPPING, &buf->dma_attrs);
+
+	nr_pages = obj->size >> PAGE_SHIFT;
+
+	p = dma_alloc_attrs(dev->dev, obj->size,
+				&buf->dma_addr, GFP_KERNEL, &buf->dma_attrs);
+	if (!p) {
+		DRM_ERROR("failed to allocate buffer.\n");
+		kfree(buf);
+		return -ENOMEM;
+	}
+
+	msm_obj->buf = buf;
+	msm_obj->pages = p;
+	return 0;
+}
+
+static int msm_drm_free_buf(struct drm_gem_object *obj)
+{
+	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+	struct msm_gem_buf *buf = msm_obj->buf;
+	struct drm_device *dev = obj->dev;
+
+	if (!buf)
+		return 0;
+
+	dma_free_attrs(dev->dev, obj->size, msm_obj->pages,
+				(dma_addr_t)buf->dma_addr, &buf->dma_attrs);
+
+	kfree(buf);
+	msm_obj->buf = NULL;
+
+	return 0;
+}
+
+int msm_drm_gem_mmap_buffer(struct drm_gem_object *obj,
+				      struct vm_area_struct *vma)
+{
+	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+	struct msm_gem_buf *buf = msm_obj->buf;
+	struct drm_device *dev = obj->dev;
+	unsigned long vm_size;
+	int ret;
+
+	vma->vm_flags &= ~VM_PFNMAP;
+	vma->vm_pgoff = 0;
+
+	vm_size = vma->vm_end - vma->vm_start;
+
+	/* check if user-requested size is valid. */
+	if (vm_size > obj->size)
+		return -EINVAL;
+
+	ret = dma_mmap_attrs(dev->dev, vma, msm_obj->pages,
+				buf->dma_addr, obj->size,
+				&buf->dma_attrs);
+	if (ret < 0) {
+		DRM_ERROR("failed to mmap.\n");
+		return ret;
+	}
+
+	return 0;
+}
+
 /* called with dev->struct_mutex held */
 static struct page **get_pages(struct drm_gem_object *obj)
 {
 	struct msm_gem_object *msm_obj = to_msm_bo(obj);
 
 	if (!msm_obj->pages) {
-		struct drm_device *dev = obj->dev;
 		struct page **p;
 		int npages = obj->size >> PAGE_SHIFT;
 
-		if (use_pages(obj))
-			p = drm_gem_get_pages(obj);
-		else
+		if (use_pages(obj)) {
+			if (!msm_drm_alloc_buf(obj))
+				p = msm_obj->pages;
+		} else {
 			p = get_pages_vram(obj, npages);
+		}
 
 		if (IS_ERR(p)) {
-			dev_err(dev->dev, "could not get pages: %ld\n",
-					PTR_ERR(p));
+			DRM_ERROR("could not get pages: %ld\n", PTR_ERR(p));
 			return p;
 		}
 
-		msm_obj->sgt = drm_prime_pages_to_sg(p, npages);
-		if (IS_ERR(msm_obj->sgt)) {
-			dev_err(dev->dev, "failed to allocate sgt\n");
-			return ERR_CAST(msm_obj->sgt);
-		}
-
 		msm_obj->pages = p;
-
-		/* For non-cached buffers, ensure the new pages are clean
-		 * because display controller, GPU, etc. are not coherent:
-		 */
-		if (msm_obj->flags & (MSM_BO_WC|MSM_BO_UNCACHED))
-			dma_map_sg(dev->dev, msm_obj->sgt->sgl,
-					msm_obj->sgt->nents, DMA_BIDIRECTIONAL);
 	}
 
 	return msm_obj->pages;
@@ -113,17 +193,8 @@ static void put_pages(struct drm_gem_object *obj)
 	struct msm_gem_object *msm_obj = to_msm_bo(obj);
 
 	if (msm_obj->pages) {
-		/* For non-cached buffers, ensure the new pages are clean
-		 * because display controller, GPU, etc. are not coherent:
-		 */
-		if (msm_obj->flags & (MSM_BO_WC|MSM_BO_UNCACHED))
-			dma_unmap_sg(obj->dev->dev, msm_obj->sgt->sgl,
-					msm_obj->sgt->nents, DMA_BIDIRECTIONAL);
-		sg_free_table(msm_obj->sgt);
-		kfree(msm_obj->sgt);
-
 		if (use_pages(obj))
-			drm_gem_put_pages(obj, msm_obj->pages, true, false);
+			msm_drm_free_buf(obj);
 		else {
 			drm_mm_remove_node(msm_obj->vram_node);
 			drm_free_large(msm_obj->pages);
@@ -257,7 +328,7 @@ static uint64_t mmap_offset(struct drm_gem_object *obj)
 	ret = drm_gem_create_mmap_offset(obj);
 
 	if (ret) {
-		dev_err(dev->dev, "could not allocate mmap offset\n");
+		DRM_ERROR("could not allocate mmap offset\n");
 		return 0;
 	}
 
@@ -288,23 +359,65 @@ int msm_gem_get_iova_locked(struct drm_gem_object *obj, int id,
 
 	if (!msm_obj->domain[id].iova) {
 		struct msm_drm_private *priv = obj->dev->dev_private;
+		int npages = obj->size >> PAGE_SHIFT;
 		struct page **pages = get_pages(obj);
 
 		if (IS_ERR(pages))
 			return PTR_ERR(pages);
 
+		if (!msm_obj->domain[id].sgt) {
+			msm_obj->domain[id].sgt =
+					drm_prime_pages_to_sg(pages, npages);
+			if (IS_ERR(msm_obj->domain[id].sgt)) {
+				DRM_ERROR("failed to allocate sgt\n");
+				return PTR_ERR(msm_obj->domain[id].sgt);
+			}
+		}
+
 		if (iommu_present(&platform_bus_type)) {
 			struct msm_mmu *mmu = priv->mmus[id];
-			uint32_t offset;
 
 			if (WARN_ON(!mmu))
 				return -EINVAL;
 
-			offset = (uint32_t)mmap_offset(obj);
-			ret = mmu->funcs->map(mmu, offset, msm_obj->sgt,
-					obj->size, IOMMU_READ | IOMMU_WRITE);
-			msm_obj->domain[id].iova = offset;
+			if (obj->import_attach && mmu->funcs->map_dma_buf) {
+				ret = mmu->funcs->map_dma_buf(mmu,
+						msm_obj->domain[id].sgt,
+						obj->import_attach->dmabuf,
+						DMA_BIDIRECTIONAL);
+				if (ret) {
+					DRM_ERROR("Unable to map dma buf\n");
+					return ret;
+				}
+				msm_obj->domain[id].iova =
+				sg_dma_address(msm_obj->domain[id].sgt->sgl);
+			} else if (!use_pages(obj)) {
+				/* use vram */
+				dma_addr_t pa = physaddr(obj);
+
+				ret = mmu->funcs->map(mmu, pa,
+						msm_obj->domain[id].sgt,
+						IOMMU_READ | IOMMU_NOEXEC);
+				if (ret) {
+					DRM_ERROR("Unable to map phy buf=%p\n",
+						(void *)pa);
+					return ret;
+				}
+				msm_obj->domain[id].iova = pa;
+			} else {
+				if (msm_obj->flags &
+						(MSM_BO_WC|MSM_BO_UNCACHED))
+					dma_map_sg(mmu->dev,
+						msm_obj->domain[id].sgt->sgl,
+						msm_obj->domain[id].sgt->nents,
+						DMA_BIDIRECTIONAL);
+				msm_obj->domain[id].iova =
+				sg_dma_address(msm_obj->domain[id].sgt->sgl);
+			}
+			DRM_DEBUG("iova=%p\n",
+					(void *)msm_obj->domain[id].iova);
 		} else {
+			WARN_ONCE(1, "physical address being used\n");
 			msm_obj->domain[id].iova = physaddr(obj);
 		}
 	}
@@ -424,11 +537,15 @@ void msm_gem_move_to_active(struct drm_gem_object *obj,
 		struct msm_gpu *gpu, bool write, uint32_t fence)
 {
 	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+	struct drm_device *dev = obj->dev;
+
+	WARN_ON(!mutex_is_locked(&dev->struct_mutex));
+
 	msm_obj->gpu = gpu;
 	if (write)
-		msm_obj->write_fence = fence;
+		msm_obj->write_timestamp = fence;
 	else
-		msm_obj->read_fence = fence;
+		msm_obj->read_timestamp = fence;
 	list_del_init(&msm_obj->mm_list);
 	list_add_tail(&msm_obj->mm_list, &gpu->active_list);
 }
@@ -442,8 +559,8 @@ void msm_gem_move_to_inactive(struct drm_gem_object *obj)
 	WARN_ON(!mutex_is_locked(&dev->struct_mutex));
 
 	msm_obj->gpu = NULL;
-	msm_obj->read_fence = 0;
-	msm_obj->write_fence = 0;
+	msm_obj->read_timestamp = 0;
+	msm_obj->write_timestamp = 0;
 	list_del_init(&msm_obj->mm_list);
 	list_add_tail(&msm_obj->mm_list, &priv->inactive_list);
 }
@@ -484,7 +601,7 @@ void msm_gem_describe(struct drm_gem_object *obj, struct seq_file *m)
 	WARN_ON(!mutex_is_locked(&dev->struct_mutex));
 	seq_printf(m, "%08x: %c(r=%u,w=%u) %2d (%2d) %08llx %p %zu\n",
 			msm_obj->flags, is_active(msm_obj) ? 'A' : 'I',
-			msm_obj->read_fence, msm_obj->write_fence,
+			msm_obj->read_timestamp, msm_obj->write_timestamp,
 			obj->name, obj->refcount.refcount.counter,
 			off, msm_obj->vaddr, obj->size);
 }
@@ -524,24 +641,49 @@ void msm_gem_free_object(struct drm_gem_object *obj)
 	for (id = 0; id < ARRAY_SIZE(msm_obj->domain); id++) {
 		struct msm_mmu *mmu = priv->mmus[id];
 		if (mmu && msm_obj->domain[id].iova) {
-			uint32_t offset = msm_obj->domain[id].iova;
-			mmu->funcs->unmap(mmu, offset, msm_obj->sgt, obj->size);
+			if (obj->import_attach && mmu->funcs->unmap_dma_buf) {
+				mmu->funcs->unmap_dma_buf(mmu,
+						msm_obj->domain[id].sgt,
+						obj->import_attach->dmabuf,
+						DMA_BIDIRECTIONAL);
+			} else if (!use_pages(obj)) {
+				uint32_t offset = msm_obj->domain[id].iova;
+
+				mmu->funcs->unmap(mmu, offset,
+					msm_obj->domain[id].sgt);
+			} else {
+				dma_unmap_sg(mmu->dev,
+					msm_obj->domain[id].sgt->sgl,
+					msm_obj->domain[id].sgt->nents,
+					DMA_BIDIRECTIONAL);
+			}
+			msm_obj->domain[id].iova = 0;
+		}
+
+		if (msm_obj->domain[id].sgt) {
+			sg_free_table(msm_obj->domain[id].sgt);
+			kfree(msm_obj->domain[id].sgt);
+			msm_obj->domain[id].sgt = NULL;
 		}
 	}
 
 	if (obj->import_attach) {
 		if (msm_obj->vaddr)
-			dma_buf_vunmap(obj->import_attach->dmabuf, msm_obj->vaddr);
+			dma_buf_vunmap(obj->import_attach->dmabuf,
+					msm_obj->vaddr);
 
 		/* Don't drop the pages for imported dmabuf, as they are not
 		 * ours, just free the array we allocated:
 		 */
-		if (msm_obj->pages)
+		if (msm_obj->pages) {
 			drm_free_large(msm_obj->pages);
+			msm_obj->pages = NULL;
+		}
 
-		drm_prime_gem_destroy(obj, msm_obj->sgt);
+		drm_prime_gem_destroy(obj, msm_obj->import_sgt);
 	} else {
-		vunmap(msm_obj->vaddr);
+		if (msm_obj->vaddr)
+			vunmap(msm_obj->vaddr);
 		put_pages(obj);
 	}
 
@@ -594,7 +736,7 @@ static int msm_gem_new_impl(struct drm_device *dev,
 	case MSM_BO_WC:
 		break;
 	default:
-		dev_err(dev->dev, "invalid cache flag: %x\n",
+		DRM_ERROR("invalid cache flag: %x\n",
 				(flags & MSM_BO_CACHE_MASK));
 		return -EINVAL;
 	}
@@ -622,6 +764,22 @@ static int msm_gem_new_impl(struct drm_device *dev,
 
 	msm_obj->resv = &msm_obj->_resv;
 	reservation_object_init(msm_obj->resv);
+
+	if (use_vram) {
+		/* Update start page index */
+		struct msm_gem_object *pos;
+		dma_addr_t start = 0;
+
+		list_for_each_entry(pos, &priv->inactive_list, mm_list) {
+			struct drm_gem_object *gem_obj = &pos->base;
+			struct drm_mm_node *vram_node = pos->vram_node;
+
+			if (vram_node)
+				start += vram_node->start;
+			start += (gem_obj->size >> PAGE_SHIFT);
+		}
+		msm_obj->vram_node->start = start;
+	}
 
 	INIT_LIST_HEAD(&msm_obj->submit_entry);
 	list_add_tail(&msm_obj->mm_list, &priv->inactive_list);
@@ -671,13 +829,15 @@ struct drm_gem_object *msm_gem_import(struct drm_device *dev,
 
 	/* if we don't have IOMMU, don't bother pretending we can import: */
 	if (!iommu_present(&platform_bus_type)) {
-		dev_err(dev->dev, "cannot import without IOMMU\n");
+		DRM_ERROR("cannot import without IOMMU\n");
 		return ERR_PTR(-EINVAL);
 	}
 
 	size = PAGE_ALIGN(size);
 
+	mutex_lock(&dev->struct_mutex);
 	ret = msm_gem_new_impl(dev, size, MSM_BO_WC, &obj);
+	mutex_unlock(&dev->struct_mutex);
 	if (ret)
 		goto fail;
 
@@ -686,14 +846,15 @@ struct drm_gem_object *msm_gem_import(struct drm_device *dev,
 	npages = size / PAGE_SIZE;
 
 	msm_obj = to_msm_bo(obj);
-	msm_obj->sgt = sgt;
+	msm_obj->import_sgt = sgt;
 	msm_obj->pages = drm_malloc_ab(npages, sizeof(struct page *));
 	if (!msm_obj->pages) {
 		ret = -ENOMEM;
 		goto fail;
 	}
 
-	ret = drm_prime_sg_to_page_addr_arrays(sgt, msm_obj->pages, NULL, npages);
+	ret = drm_prime_sg_to_page_addr_arrays(sgt, msm_obj->pages, NULL,
+						 npages);
 	if (ret)
 		goto fail;
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -107,6 +107,7 @@ struct msm_compr_pdata {
 	bool use_legacy_api; /* indicates use older asm apis*/
 	struct msm_compr_dec_params *dec_params[MSM_FRONTEND_DAI_MAX];
 	struct msm_compr_ch_map *ch_map[MSM_FRONTEND_DAI_MAX];
+	bool is_in_use[MSM_FRONTEND_DAI_MAX];
 };
 
 struct msm_compr_audio {
@@ -487,7 +488,8 @@ static void compr_event_handler(uint32_t opcode,
 		if (!atomic_read(&prtd->start)) {
 			/* Writes must be restarted from _copy() */
 			pr_debug("write_done received while not started, treat as xrun");
-			atomic_set(&prtd->xrun, 1);
+			if (prtd->dsp_fragments_sent == 0)
+				atomic_set(&prtd->xrun, 1);
 			spin_unlock_irqrestore(&prtd->lock, flags);
 			break;
 		}
@@ -637,16 +639,20 @@ static void compr_event_handler(uint32_t opcode,
 			 * WRITE_DONE(X)
 			 * RESUME
 			 */
-			if ((prtd->copied_total == prtd->bytes_sent) &&
-			    atomic_read(&prtd->drain)) {
-				pr_debug("RUN ack, wake up & continue pending drain\n");
+			if (prtd->copied_total == prtd->bytes_sent) {
+				if (atomic_read(&prtd->drain)) {
+					pr_debug("RUN ack, wake up & continue pending drain\n");
 
-				if (prtd->last_buffer)
-					prtd->last_buffer = 0;
+					if (prtd->last_buffer)
+						prtd->last_buffer = 0;
 
-				prtd->drain_ready = 1;
-				wake_up(&prtd->drain_wait);
-				atomic_set(&prtd->drain, 0);
+					prtd->drain_ready = 1;
+					wake_up(&prtd->drain_wait);
+					atomic_set(&prtd->drain, 0);
+				} else if (prtd->dsp_fragments_sent) {
+					pr_info("RUN ack, resume for pending frames\n");
+					msm_compr_send_buffer(prtd);
+				}
 			}
 
 			spin_unlock_irqrestore(&prtd->lock, flags);
@@ -751,7 +757,7 @@ static void populate_codec_list(struct msm_compr_audio *prtd)
 			COMPR_PLAYBACK_MIN_NUM_FRAGMENTS;
 	prtd->compr_cap.max_fragments =
 			COMPR_PLAYBACK_MAX_NUM_FRAGMENTS;
-	prtd->compr_cap.num_codecs = 13;
+	prtd->compr_cap.num_codecs = 14;
 	prtd->compr_cap.codecs[0] = SND_AUDIOCODEC_MP3;
 	prtd->compr_cap.codecs[1] = SND_AUDIOCODEC_AAC;
 	prtd->compr_cap.codecs[2] = SND_AUDIOCODEC_AC3;
@@ -765,6 +771,7 @@ static void populate_codec_list(struct msm_compr_audio *prtd)
 	prtd->compr_cap.codecs[10] = SND_AUDIOCODEC_ALAC;
 	prtd->compr_cap.codecs[11] = SND_AUDIOCODEC_APE;
 	prtd->compr_cap.codecs[12] = SND_AUDIOCODEC_DTS;
+	prtd->compr_cap.codecs[13] = SND_AUDIOCODEC_APTX;
 }
 
 static int msm_compr_send_media_format_block(struct snd_compr_stream *cstream,
@@ -783,6 +790,7 @@ static int msm_compr_send_media_format_block(struct snd_compr_stream *cstream,
 	struct asm_vorbis_cfg vorbis_cfg;
 	struct asm_alac_cfg alac_cfg;
 	struct asm_ape_cfg ape_cfg;
+	struct aptx_dec_bt_addr_cfg aptx_cfg;
 	union snd_codec_options *codec_options;
 
 	int ret = 0;
@@ -852,6 +860,9 @@ static int msm_compr_send_media_format_block(struct snd_compr_stream *cstream,
 		if (prtd->codec_param.codec.format ==
 					SND_AUDIOSTREAMFORMAT_MP4ADTS)
 			aac_cfg.format = 0x0;
+		else if (prtd->codec_param.codec.format ==
+					SND_AUDIOSTREAMFORMAT_MP4LATM)
+			aac_cfg.format = 0x04;
 		else
 			aac_cfg.format = 0x03;
 		aac_cfg.ch_cfg = prtd->num_channels;
@@ -994,7 +1005,24 @@ static int msm_compr_send_media_format_block(struct snd_compr_stream *cstream,
 		pr_debug("SND_AUDIOCODEC_DTS\n");
 		/* no media format block needed */
 		break;
-
+	case FORMAT_APTX:
+		pr_debug("SND_AUDIOCODEC_APTX\n");
+		memset(&aptx_cfg, 0x0, sizeof(struct aptx_dec_bt_addr_cfg));
+		ret = q6asm_stream_media_format_block_aptx_dec(
+							prtd->audio_client,
+							prtd->sample_rate,
+							stream_id);
+		if (ret >= 0) {
+			aptx_cfg.nap = codec_options->aptx_dec.nap;
+			aptx_cfg.uap = codec_options->aptx_dec.uap;
+			aptx_cfg.lap = codec_options->aptx_dec.lap;
+			q6asm_set_aptx_dec_bt_addr(prtd->audio_client,
+							&aptx_cfg);
+		} else {
+			pr_err("%s: CMD Format block failed ret %d\n",
+					 __func__, ret);
+		}
+		break;
 	default:
 		pr_debug("%s, unsupported format, skip", __func__);
 		break;
@@ -1296,11 +1324,16 @@ static int msm_compr_playback_open(struct snd_compr_stream *cstream)
 {
 	struct snd_compr_runtime *runtime = cstream->runtime;
 	struct snd_soc_pcm_runtime *rtd = cstream->private_data;
-	struct msm_compr_audio *prtd;
+	struct msm_compr_audio *prtd = NULL;
 	struct msm_compr_pdata *pdata =
 			snd_soc_platform_get_drvdata(rtd->platform);
 
 	pr_debug("%s\n", __func__);
+	if (pdata->is_in_use[rtd->dai_link->be_id] == true) {
+		pr_err("%s: %s is already in use,err: %d ",
+			__func__, rtd->dai_link->cpu_dai_name, -EBUSY);
+		return -EBUSY;
+	}
 	prtd = kzalloc(sizeof(struct msm_compr_audio), GFP_KERNEL);
 	if (prtd == NULL) {
 		pr_err("Failed to allocate memory for msm_compr_audio\n");
@@ -1312,7 +1345,7 @@ static int msm_compr_playback_open(struct snd_compr_stream *cstream)
 	pdata->cstream[rtd->dai_link->be_id] = cstream;
 	pdata->audio_effects[rtd->dai_link->be_id] =
 		 kzalloc(sizeof(struct msm_compr_audio_effects), GFP_KERNEL);
-	if (!pdata->audio_effects[rtd->dai_link->be_id]) {
+	if (pdata->audio_effects[rtd->dai_link->be_id] == NULL) {
 		pr_err("%s: Could not allocate memory for effects\n", __func__);
 		pdata->cstream[rtd->dai_link->be_id] = NULL;
 		kfree(prtd);
@@ -1320,10 +1353,11 @@ static int msm_compr_playback_open(struct snd_compr_stream *cstream)
 	}
 	pdata->dec_params[rtd->dai_link->be_id] =
 		 kzalloc(sizeof(struct msm_compr_dec_params), GFP_KERNEL);
-	if (!pdata->dec_params[rtd->dai_link->be_id]) {
+	if (pdata->dec_params[rtd->dai_link->be_id] == NULL) {
 		pr_err("%s: Could not allocate memory for dec params\n",
 			__func__);
 		kfree(pdata->audio_effects[rtd->dai_link->be_id]);
+		pdata->audio_effects[rtd->dai_link->be_id] = NULL;
 		pdata->cstream[rtd->dai_link->be_id] = NULL;
 		kfree(prtd);
 		return -ENOMEM;
@@ -1368,18 +1402,21 @@ static int msm_compr_playback_open(struct snd_compr_stream *cstream)
 	populate_codec_list(prtd);
 	prtd->audio_client = q6asm_audio_client_alloc(
 				(app_cb)compr_event_handler, prtd);
-	if (!prtd->audio_client) {
+	if (prtd->audio_client == NULL) {
 		pr_err("%s: Could not allocate memory for client\n", __func__);
 		kfree(pdata->audio_effects[rtd->dai_link->be_id]);
+		pdata->audio_effects[rtd->dai_link->be_id] = NULL;
 		kfree(pdata->dec_params[rtd->dai_link->be_id]);
+		pdata->dec_params[rtd->dai_link->be_id] = NULL;
 		pdata->cstream[rtd->dai_link->be_id] = NULL;
-		runtime->private_data = NULL;
 		kfree(prtd);
+		runtime->private_data = NULL;
 		return -ENOMEM;
 	}
 	pr_debug("%s: session ID %d\n", __func__, prtd->audio_client->session);
 	prtd->audio_client->perf_mode = false;
 	prtd->session_id = prtd->audio_client->session;
+	pdata->is_in_use[rtd->dai_link->be_id] = true;
 
 	return 0;
 }
@@ -1535,11 +1572,15 @@ static int msm_compr_playback_free(struct snd_compr_stream *cstream)
 	q6asm_audio_client_buf_free_contiguous(dir, ac);
 
 	q6asm_audio_client_free(ac);
-
-	kfree(pdata->audio_effects[soc_prtd->dai_link->be_id]);
-	pdata->audio_effects[soc_prtd->dai_link->be_id] = NULL;
-	kfree(pdata->dec_params[soc_prtd->dai_link->be_id]);
-	pdata->dec_params[soc_prtd->dai_link->be_id] = NULL;
+	if (pdata->audio_effects[soc_prtd->dai_link->be_id] != NULL) {
+		kfree(pdata->audio_effects[soc_prtd->dai_link->be_id]);
+		pdata->audio_effects[soc_prtd->dai_link->be_id] = NULL;
+	}
+	if (pdata->dec_params[soc_prtd->dai_link->be_id] != NULL) {
+		kfree(pdata->dec_params[soc_prtd->dai_link->be_id]);
+		pdata->dec_params[soc_prtd->dai_link->be_id] = NULL;
+	}
+	pdata->is_in_use[soc_prtd->dai_link->be_id] = false;
 	kfree(prtd);
 	runtime->private_data = NULL;
 
@@ -1601,6 +1642,7 @@ static int msm_compr_capture_free(struct snd_compr_stream *cstream)
 	q6asm_audio_client_free(ac);
 
 	kfree(prtd);
+	runtime->private_data = NULL;
 
 	return 0;
 }
@@ -1763,7 +1805,11 @@ static int msm_compr_set_params(struct snd_compr_stream *cstream,
 		prtd->codec = FORMAT_DTS;
 		break;
 	}
-
+	case SND_AUDIOCODEC_APTX: {
+		pr_debug("%s: SND_AUDIOCODEC_APTX\n", __func__);
+		prtd->codec = FORMAT_APTX;
+		break;
+	}
 	default:
 		pr_err("codec not supported, id =%d\n", params->codec.id);
 		return -EINVAL;
@@ -1957,6 +2003,7 @@ static int msm_compr_trigger(struct snd_compr_stream *cstream, int cmd)
 		prtd->last_buffer = 0;
 		prtd->cmd_ack = 0;
 		if (!prtd->gapless_state.gapless_transition) {
+			q6asm_cmd_nowait(prtd->audio_client, CMD_PAUSE);
 			pr_debug("issue CMD_FLUSH stream_id %d\n", stream_id);
 			spin_unlock_irqrestore(&prtd->lock, flags);
 			q6asm_stream_cmd(
@@ -2636,6 +2683,8 @@ static int msm_compr_get_codec_caps(struct snd_compr_stream *cstream,
 		break;
 	case SND_AUDIOCODEC_DTS:
 		break;
+	case SND_AUDIOCODEC_APTX:
+		break;
 	default:
 		pr_err("%s: Unsupported audio codec %d\n",
 			__func__, codec->codec);
@@ -3007,6 +3056,7 @@ static int msm_compr_send_dec_params(struct snd_compr_stream *cstream,
 	switch (prtd->codec) {
 	case FORMAT_MP3:
 	case FORMAT_MPEG4_AAC:
+	case FORMAT_APTX:
 		pr_debug("%s: no runtime parameters for codec: %d\n", __func__,
 			 prtd->codec);
 		break;
@@ -3072,6 +3122,7 @@ static int msm_compr_dec_params_put(struct snd_kcontrol *kcontrol,
 	case FORMAT_ALAC:
 	case FORMAT_APE:
 	case FORMAT_DTS:
+	case FORMAT_APTX:
 		pr_debug("%s: no runtime parameters for codec: %d\n", __func__,
 			 prtd->codec);
 		break;
@@ -3117,7 +3168,7 @@ static int msm_compr_dec_params_get(struct snd_kcontrol *kcontrol,
 	return 0;
 }
 
-static int msm_compr_app_type_cfg_put(struct snd_kcontrol *kcontrol,
+static int msm_compr_playback_app_type_cfg_put(struct snd_kcontrol *kcontrol,
 				      struct snd_ctl_elem_value *ucontrol)
 {
 	u64 fe_id = kcontrol->private_value;
@@ -3144,7 +3195,7 @@ static int msm_compr_app_type_cfg_put(struct snd_kcontrol *kcontrol,
 	return 0;
 }
 
-static int msm_compr_app_type_cfg_get(struct snd_kcontrol *kcontrol,
+static int msm_compr_playback_app_type_cfg_get(struct snd_kcontrol *kcontrol,
 				      struct snd_ctl_elem_value *ucontrol)
 {
 	u64 fe_id = kcontrol->private_value;
@@ -3174,6 +3225,68 @@ static int msm_compr_app_type_cfg_get(struct snd_kcontrol *kcontrol,
 	ucontrol->value.integer.value[2] = sample_rate;
 	pr_debug("%s: fedai_id %llu, session_type %d, app_type %d, acdb_dev_id %d, sample_rate %d\n",
 		__func__, fe_id, SESSION_TYPE_RX,
+		app_type, acdb_dev_id, sample_rate);
+done:
+	return ret;
+}
+
+static int msm_compr_capture_app_type_cfg_put(struct snd_kcontrol *kcontrol,
+					struct snd_ctl_elem_value *ucontrol)
+{
+	u64 fe_id = kcontrol->private_value;
+	int app_type;
+	int acdb_dev_id;
+	int sample_rate = 48000;
+
+	pr_debug("%s: fe_id- %llu\n", __func__, fe_id);
+	if (fe_id >= MSM_FRONTEND_DAI_MAX) {
+		pr_err("%s Received out of bounds fe_id %llu\n",
+			__func__, fe_id);
+		return -EINVAL;
+	}
+
+	app_type = ucontrol->value.integer.value[0];
+	acdb_dev_id = ucontrol->value.integer.value[1];
+	if (0 != ucontrol->value.integer.value[2])
+		sample_rate = ucontrol->value.integer.value[2];
+	pr_debug("%s: app_type- %d acdb_dev_id- %d sample_rate- %d session_type- %d\n",
+		__func__, app_type, acdb_dev_id, sample_rate, SESSION_TYPE_TX);
+	msm_pcm_routing_reg_stream_app_type_cfg(fe_id, app_type,
+		acdb_dev_id, sample_rate, SESSION_TYPE_TX);
+
+	return 0;
+}
+
+static int msm_compr_capture_app_type_cfg_get(struct snd_kcontrol *kcontrol,
+					struct snd_ctl_elem_value *ucontrol)
+{
+	u64 fe_id = kcontrol->private_value;
+	int ret = 0;
+	int app_type;
+	int acdb_dev_id;
+	int sample_rate;
+
+	pr_debug("%s: fe_id- %llu\n", __func__, fe_id);
+	if (fe_id >= MSM_FRONTEND_DAI_MAX) {
+		pr_err("%s Received out of bounds fe_id %llu\n",
+			__func__, fe_id);
+		ret = -EINVAL;
+		goto done;
+	}
+
+	ret = msm_pcm_routing_get_stream_app_type_cfg(fe_id, SESSION_TYPE_TX,
+		&app_type, &acdb_dev_id, &sample_rate);
+	if (ret < 0) {
+		pr_err("%s: msm_pcm_routing_get_stream_app_type_cfg failed returned %d\n",
+			__func__, ret);
+		goto done;
+	}
+
+	ucontrol->value.integer.value[0] = app_type;
+	ucontrol->value.integer.value[1] = acdb_dev_id;
+	ucontrol->value.integer.value[2] = sample_rate;
+	pr_debug("%s: fedai_id %llu, session_type %d, app_type %d, acdb_dev_id %d, sample_rate %d\n",
+		__func__, fe_id, SESSION_TYPE_TX,
 		app_type, acdb_dev_id, sample_rate);
 done:
 	return ret;
@@ -3291,6 +3404,7 @@ static int msm_compr_probe(struct snd_soc_platform *platform)
 		pdata->dec_params[i] = NULL;
 		pdata->cstream[i] = NULL;
 		pdata->ch_map[i] = NULL;
+		pdata->is_in_use[i] = false;
 	}
 
 	snd_soc_add_platform_controls(platform, msm_compr_gapless_controls,
@@ -3566,7 +3680,8 @@ static int msm_compr_add_dec_runtime_params_control(
 
 static int msm_compr_add_app_type_cfg_control(struct snd_soc_pcm_runtime *rtd)
 {
-	const char *mixer_ctl_name	= "Audio Stream";
+	const char *playback_mixer_ctl_name	= "Audio Stream";
+	const char *capture_mixer_ctl_name	= "Audio Stream Capture";
 	const char *deviceNo		= "NN";
 	const char *suffix		= "App Type Cfg";
 	char *mixer_str = NULL;
@@ -3577,8 +3692,8 @@ static int msm_compr_add_app_type_cfg_control(struct snd_soc_pcm_runtime *rtd)
 		.name = "?",
 		.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
 		.info = msm_compr_app_type_cfg_info,
-		.put = msm_compr_app_type_cfg_put,
-		.get = msm_compr_app_type_cfg_get,
+		.put = msm_compr_playback_app_type_cfg_put,
+		.get = msm_compr_playback_app_type_cfg_get,
 		.private_value = 0,
 		}
 	};
@@ -3589,11 +3704,15 @@ static int msm_compr_add_app_type_cfg_control(struct snd_soc_pcm_runtime *rtd)
 	}
 
 	pr_debug("%s: added new compr FE ctl with name %s, id %d, cpu dai %s, device no %d\n",
-		 __func__, rtd->dai_link->name, rtd->dai_link->be_id,
-		 rtd->dai_link->cpu_dai_name, rtd->pcm->device);
+		__func__, rtd->dai_link->name, rtd->dai_link->be_id,
+			rtd->dai_link->cpu_dai_name, rtd->pcm->device);
+	if (rtd->compr->direction == SND_COMPRESS_PLAYBACK)
+		ctl_len = strlen(playback_mixer_ctl_name) + 1 + strlen(deviceNo)
+			 + 1 + strlen(suffix) + 1;
+	else
+		ctl_len = strlen(capture_mixer_ctl_name) + 1 + strlen(deviceNo)
+			+ 1 + strlen(suffix) + 1;
 
-	ctl_len = strlen(mixer_ctl_name) + 1 + strlen(deviceNo) + 1 +
-		  strlen(suffix) + 1;
 	mixer_str = kzalloc(ctl_len, GFP_KERNEL);
 
 	if (!mixer_str) {
@@ -3601,14 +3720,31 @@ static int msm_compr_add_app_type_cfg_control(struct snd_soc_pcm_runtime *rtd)
 		return 0;
 	}
 
-	snprintf(mixer_str, ctl_len, "%s %d %s", mixer_ctl_name,
-		 rtd->pcm->device, suffix);
+	if (rtd->compr->direction == SND_COMPRESS_PLAYBACK)
+		snprintf(mixer_str, ctl_len, "%s %d %s",
+			 playback_mixer_ctl_name, rtd->pcm->device, suffix);
+	else
+		snprintf(mixer_str, ctl_len, "%s %d %s",
+			 capture_mixer_ctl_name, rtd->pcm->device, suffix);
+
 	fe_app_type_cfg_control[0].name = mixer_str;
 	fe_app_type_cfg_control[0].private_value = rtd->dai_link->be_id;
+
+	if (rtd->compr->direction == SND_COMPRESS_PLAYBACK) {
+		fe_app_type_cfg_control[0].put =
+					 msm_compr_playback_app_type_cfg_put;
+		fe_app_type_cfg_control[0].get =
+					 msm_compr_playback_app_type_cfg_get;
+	} else {
+		fe_app_type_cfg_control[0].put =
+					 msm_compr_capture_app_type_cfg_put;
+		fe_app_type_cfg_control[0].get =
+					 msm_compr_capture_app_type_cfg_get;
+	}
 	pr_debug("Registering new mixer ctl %s", mixer_str);
 	snd_soc_add_platform_controls(rtd->platform,
-				      fe_app_type_cfg_control,
-				      ARRAY_SIZE(fe_app_type_cfg_control));
+				fe_app_type_cfg_control,
+				ARRAY_SIZE(fe_app_type_cfg_control));
 	kfree(mixer_str);
 	return 0;
 }

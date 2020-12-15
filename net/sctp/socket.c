@@ -1604,7 +1604,7 @@ static int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
 	sctp_assoc_t associd = 0;
 	sctp_cmsgs_t cmsgs = { NULL };
 	sctp_scope_t scope;
-	bool fill_sinfo_ttl = false;
+	bool fill_sinfo_ttl = false, wait_connect = false;
 	struct sctp_datamsg *datamsg;
 	int msg_flags = msg->msg_flags;
 	__u16 sinfo_flags = 0;
@@ -1944,6 +1944,7 @@ static int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
 		if (err < 0)
 			goto out_free;
 
+		wait_connect = true;
 		pr_debug("%s: we associated primitively\n", __func__);
 	}
 
@@ -1980,6 +1981,11 @@ static int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
 
 	sctp_datamsg_put(datamsg);
 	err = msg_len;
+
+	if (unlikely(wait_connect)) {
+		timeo = sock_sndtimeo(sk, msg_flags & MSG_DONTWAIT);
+		sctp_wait_for_connect(asoc, &timeo);
+	}
 
 	/* If we are already past ASSOCIATE, the lower
 	 * layers are responsible for association cleanup.
@@ -4429,6 +4435,10 @@ int sctp_do_peeloff(struct sock *sk, sctp_assoc_t id, struct socket **sockp)
 	struct sctp_sock *sp = sctp_sk(sk);
 	struct socket *sock;
 	int err = 0;
+
+	/* Do not peel off from one netns to another one. */
+	if (!net_eq(current->nsproxy->net_ns, sock_net(sk)))
+		return -EINVAL;
 
 	if (!asoc)
 		return -EINVAL;

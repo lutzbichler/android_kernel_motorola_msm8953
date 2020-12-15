@@ -476,9 +476,6 @@
 		linux,contiguous-region = <&tzlog_bck_mem>;
 	};
 
-	qcom,mdss_wb_panel {
-		status = "disabled";
-	};
 };
 
 &blsp1_uart2 {
@@ -657,6 +654,14 @@
 		qcom,ain-route = <0>; /* AMUX 5 */
 		qcom,master-en = <1>;
 		qcom,src-sel = <0>; /* Function constant */
+	};
+};
+
+&spmi_bus {
+	qcom,pmi8950@2 {
+		qcom,power-on@800 {
+			qcom,shipmode;
+		};
 	};
 };
 

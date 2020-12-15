@@ -273,7 +273,11 @@ enum eeprom_cfg_type_t {
 	CFG_EEPROM_WRITE_DATA,
 	CFG_EEPROM_GET_MM_INFO,
 	CFG_EEPROM_INIT,
-	CFG_EEPROM_REINIT
+	CFG_EEPROM_REINIT,
+#if defined(MULTI_CAMERA_DEEN) || defined(VENDOR_CAMERA_DEEN)
+	BST_CFG_EEPROM_WRITE_DUALCAM_CALI_DATA,
+	BST_CFG_EEPROM_READ_DUALCAM_CALI_DATA,
+#endif
 };
 
 struct eeprom_get_t {
@@ -289,7 +293,18 @@ struct eeprom_write_t {
 	uint8_t *dbuffer;
 	uint32_t num_bytes;
 };
-
+#if defined(MULTI_CAMERA_DEEN) || defined(VENDOR_CAMERA_DEEN)
+struct bst_eeprom_read_t {
+	uint32_t offset_addr;
+	uint8_t *dbuffer;
+	uint32_t num_bytes;
+};
+struct bst_eeprom_write_t {
+	uint32_t offset_addr;
+	uint8_t *dbuffer;
+	uint32_t num_bytes;
+};
+#endif
 struct eeprom_get_cmm_t {
 	uint32_t cmm_support;
 	uint32_t cmm_compression;
@@ -316,12 +331,16 @@ struct msm_eeprom_cfg_data {
 	enum eeprom_cfg_type_t cfgtype;
 	uint8_t is_supported;
 	union {
-		char eeprom_name[MAX_EEPROM_NAME];
+		char eeprom_name[MAX_SENSOR_NAME];
 		struct eeprom_get_t get_data;
 		struct eeprom_read_t read_data;
 		struct eeprom_write_t write_data;
 		struct eeprom_get_cmm_t get_cmm_data;
 		struct msm_eeprom_info_t eeprom_info;
+#if defined(MULTI_CAMERA_DEEN) || defined(VENDOR_CAMERA_DEEN)
+		struct bst_eeprom_read_t bst_read_data;
+		struct bst_eeprom_write_t bst_write_data;
+#endif
 	} cfg;
 };
 

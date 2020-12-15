@@ -2264,6 +2264,7 @@ struct synaptics_rmi4_exp_fn {
 	void (*func_remove)(struct synaptics_rmi4_data *rmi4_data);
 	void (*func_attn)(struct synaptics_rmi4_data *rmi4_data,
 			unsigned char intr_mask);
+	int (*func_status)(struct synaptics_rmi4_data *rmi4_data);
 	struct list_head link;
 };
 
@@ -2778,24 +2779,33 @@ static int synaptics_dsx_wait_for_idle(struct synaptics_rmi4_data *rmi4_data)
 	return 0;
 }
 
+static int synaptics_rmi4_f01_flashprog_status(
+		struct synaptics_rmi4_data *rmi4_data)
+{
+	int retval;
+	struct synaptics_rmi4_f01_device_status status;
+
+	retval = synaptics_rmi4_i2c_read(rmi4_data,
+					rmi4_data->f01_data_base_addr,
+					status.data,
+					sizeof(status.data));
+	return retval < 0 ? retval : status.flash_prog;
+}
+
 static int synaptics_dsx_sensor_ready_state(
 		struct synaptics_rmi4_data *rmi4_data, bool standby)
 {
 	bool ui_mode;
 	int retval, state, i;
-	struct synaptics_rmi4_f01_device_status status;
 
 	for (i = 0; i < 10; ++i) {
-		retval = synaptics_rmi4_i2c_read(rmi4_data,
-					rmi4_data->f01_data_base_addr,
-					status.data,
-					sizeof(status.data));
+		retval = rmi4_data->get_status(rmi4_data);
 		if (retval < 0) {
 			pr_err("(%d) Failed to query touch ic status\n", i);
 			return retval;
 		}
 
-		ui_mode = status.flash_prog == 0;
+		ui_mode = retval == 0;
 		pr_debug("(%d) UI mode: %s\n", i, ui_mode ? "true" : "false");
 
 		if (ui_mode)
@@ -2854,6 +2864,7 @@ static void synaptics_dsx_sensor_state(struct synaptics_rmi4_data *rmi4_data,
 
 	switch (state) {
 	case STATE_UNKNOWN:
+		rmi4_data->in_bootloader = false;
 	case STATE_FLASH:
 		/* no special handling for these states */
 			break;
@@ -5302,12 +5313,6 @@ static int synaptics_rmi4_f11_init(struct synaptics_rmi4_data *rmi4_data,
 	}
 
 	fhandler->intr_reg_num = (intr_count + 7) / 8;
-	if (fhandler->intr_reg_num >= MAX_INTR_REGISTERS) {
-		fhandler->intr_reg_num = 0;
-		fhandler->num_of_data_sources = 0;
-		fhandler->intr_mask = 0;
-		return -EINVAL;
-	}
 	if (fhandler->intr_reg_num != 0)
 		fhandler->intr_reg_num -= 1;
 
@@ -5452,12 +5457,6 @@ static int synaptics_rmi4_f51_init(struct synaptics_rmi4_data *rmi4_data,
 	fhandler->fn_number = fd->fn_number;
 	fhandler->num_of_data_sources = (fd->intr_src_count  & MASK_3BIT);
 	fhandler->intr_reg_num = (intr_count + 7) / 8;
-	if (fhandler->intr_reg_num >= MAX_INTR_REGISTERS) {
-		fhandler->intr_reg_num = 0;
-		fhandler->num_of_data_sources = 0;
-		fhandler->intr_mask = 0;
-		return -EINVAL;
-	}
 	if (fhandler->intr_reg_num != 0)
 		fhandler->intr_reg_num -= 1;
 	/* Set an enable bit for each data source */
@@ -5591,12 +5590,6 @@ static int synaptics_rmi4_f12_init(struct synaptics_rmi4_data *rmi4_data,
 		return -ENOENT;
 
 	fhandler->intr_reg_num = (intr_count + 7) / 8;
-	if (fhandler->intr_reg_num >= MAX_INTR_REGISTERS) {
-		fhandler->intr_reg_num = 0;
-		fhandler->num_of_data_sources = 0;
-		fhandler->intr_mask = 0;
-		return -EINVAL;
-	}
 	if (fhandler->intr_reg_num != 0)
 		fhandler->intr_reg_num -= 1;
 
@@ -5718,13 +5711,6 @@ static int synaptics_rmi4_f1a_init(struct synaptics_rmi4_data *rmi4_data,
 	fhandler->num_of_data_sources = (fd->intr_src_count  & MASK_3BIT);
 
 	fhandler->intr_reg_num = (intr_count + 7) / 8;
-	if (fhandler->intr_reg_num >= MAX_INTR_REGISTERS) {
-		fhandler->intr_reg_num = 0;
-		fhandler->num_of_data_sources = 0;
-		fhandler->intr_mask = 0;
-		retval = -EINVAL;
-		goto error_exit;
-	}
 	if (fhandler->intr_reg_num != 0)
 		fhandler->intr_reg_num -= 1;
 
@@ -6172,8 +6158,11 @@ static int synaptics_rmi4_query_device(struct synaptics_rmi4_data *rmi4_data)
 				if (retval < 0)
 					return retval;
 
-				rmi4_data->in_bootloader =
-						status.flash_prog == 1;
+				/* FlashProg bit might be inaccurate, so */
+				/* do not change the flag if it is set */
+				if (!rmi4_data->in_bootloader)
+					rmi4_data->in_bootloader =
+							status.flash_prog == 1;
 				break;
 
 			case SYNAPTICS_RMI4_F11:
@@ -6267,8 +6256,6 @@ static int synaptics_rmi4_query_device(struct synaptics_rmi4_data *rmi4_data)
 	dev_dbg(&rmi4_data->i2c_client->dev,
 			"%s: Number of interrupt registers = %d\n",
 			__func__, rmi4_data->num_of_intr_regs);
-	if (rmi4_data->num_of_intr_regs >= MAX_INTR_REGISTERS)
-		return -EINVAL;
 
 	f12_handler = get_fhandler(rmi4_data, SYNAPTICS_RMI4_F12);
 	if (!f12_handler) {
@@ -6754,6 +6741,29 @@ static void synaptics_rmi4_detection_work(struct work_struct *work)
 			} else
 				control_access_block_update_dynamic(rmi4_data);
 		}
+
+
+		if (exp_fhandler->fn_type == RMI_FW_UPDATER) {
+			int status;
+
+			if (!exp_fhandler->func_status)
+				continue;
+			status = exp_fhandler->func_status(rmi4_data);
+			/* consider changing to */
+			/* if (status == 1) */
+			/* if Synaptics confirm only 1 is valid */
+			if (status) {
+				struct synaptics_rmi4_device_info *rmi;
+
+				rmi = &(rmi4_data->rmi4_mod_info);
+				rmi4_data->in_bootloader = true;
+				pr_info("Product: %s is in bootloader mode\n",
+					rmi->product_id_string);
+			}
+			/* replace default status retrieval function */
+			rmi4_data->get_status = exp_fhandler->func_status;
+			pr_info("using F34 status retrieval function\n");
+		}
 	}
 
 release_mutex:
@@ -6778,7 +6788,9 @@ void synaptics_rmi4_new_function(enum exp_fn fn_type, bool insert,
 		int (*func_init)(struct synaptics_rmi4_data *rmi4_data),
 		void (*func_remove)(struct synaptics_rmi4_data *rmi4_data),
 		void (*func_attn)(struct synaptics_rmi4_data *rmi4_data,
-		unsigned char intr_mask), enum ic_modes mode)
+		unsigned char intr_mask),
+		int (*func_status)(struct synaptics_rmi4_data *rmi4_data),
+		enum ic_modes mode)
 {
 	struct synaptics_rmi4_exp_fn *exp_fhandler;
 
@@ -6806,6 +6818,7 @@ void synaptics_rmi4_new_function(enum exp_fn fn_type, bool insert,
 		exp_fhandler->fn_type = fn_type;
 		exp_fhandler->func_init = func_init;
 		exp_fhandler->func_attn = func_attn;
+		exp_fhandler->func_status = func_status;
 		exp_fhandler->func_remove = func_remove;
 		exp_fhandler->inserted = false;
 		exp_fhandler->mode = mode;
@@ -6816,6 +6829,7 @@ void synaptics_rmi4_new_function(enum exp_fn fn_type, bool insert,
 				exp_fhandler->inserted = false;
 				exp_fhandler->func_init = NULL;
 				exp_fhandler->func_attn = NULL;
+				exp_fhandler->func_status = NULL;
 				goto exit;
 			}
 		}
@@ -7195,6 +7209,7 @@ static int synaptics_rmi4_probe(struct i2c_client *client,
 	rmi4_data->ready_state = synaptics_dsx_sensor_ready_state;
 	rmi4_data->irq_enable = synaptics_rmi4_irq_enable;
 	rmi4_data->reset_device = synaptics_rmi4_reset_device;
+	rmi4_data->get_status = synaptics_rmi4_f01_flashprog_status;
 
 	/* Initialize some resume debug information */
 	rmi4_data->resume_info = kzalloc(

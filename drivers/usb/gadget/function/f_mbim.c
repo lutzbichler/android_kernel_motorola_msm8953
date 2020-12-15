@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2016,2017 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -34,15 +34,6 @@
 
 #define MBIM_BULK_BUFFER_SIZE		4096
 #define MAX_CTRL_PKT_SIZE		4096
-
-enum mbim_peripheral_ep_type {
-	MBIM_DATA_EP_TYPE_RESERVED   = 0x0,
-	MBIM_DATA_EP_TYPE_HSIC       = 0x1,
-	MBIM_DATA_EP_TYPE_HSUSB      = 0x2,
-	MBIM_DATA_EP_TYPE_PCIE       = 0x3,
-	MBIM_DATA_EP_TYPE_EMBEDDED   = 0x4,
-	MBIM_DATA_EP_TYPE_BAM_DMUX   = 0x5,
-};
 
 struct mbim_peripheral_ep_info {
 	enum peripheral_ep_type	ep_type;
@@ -768,7 +759,6 @@ static void mbim_notify_complete(struct usb_ep *ep, struct usb_request *req)
 		break;
 	}
 
-	mbim_do_notify(mbim);
 	spin_unlock(&mbim->lock);
 
 	pr_debug("dev:%pK Exit\n", mbim);
@@ -878,6 +868,17 @@ fmbim_cmd_complete(struct usb_ep *ep, struct usb_request *req)
 	return;
 }
 
+static void mbim_response_complete(struct usb_ep *ep, struct usb_request *req)
+{
+	struct f_mbim *mbim = req->context;
+
+	pr_debug("%s: queue notify request if any new response available\n"
+			, __func__);
+	spin_lock(&mbim->lock);
+	mbim_do_notify(mbim);
+	spin_unlock(&mbim->lock);
+}
+
 static int
 mbim_setup(struct usb_function *f, const struct usb_ctrlrequest *ctrl)
 {
@@ -957,6 +958,8 @@ mbim_setup(struct usb_function *f, const struct usb_ctrlrequest *ctrl)
 		pr_debug("copied encapsulated_response %d bytes\n",
 			value);
 
+		req->complete = mbim_response_complete;
+		req->context = mbim;
 		break;
 
 	case ((USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE) << 8)
@@ -2008,7 +2011,7 @@ static long mbim_ioctl(struct file *fp, unsigned cmd, unsigned long arg)
 			 * This channel number 8 should be in sync with
 			 * the one defined in u_bam.c.
 			 */
-			info.ph_ep_info.ep_type = MBIM_DATA_EP_TYPE_BAM_DMUX;
+			info.ph_ep_info.ep_type = DATA_EP_TYPE_BAM_DMUX;
 			info.ph_ep_info.peripheral_iface_id =
 						BAM_DMUX_CHANNEL_ID;
 			info.ipa_ep_pair.cons_pipe_num = 0;
@@ -2023,7 +2026,7 @@ static long mbim_ioctl(struct file *fp, unsigned cmd, unsigned long arg)
 				break;
 			}
 
-			info.ph_ep_info.ep_type = MBIM_DATA_EP_TYPE_HSUSB;
+			info.ph_ep_info.ep_type = DATA_EP_TYPE_HSUSB;
 			info.ph_ep_info.peripheral_iface_id = mbim->data_id;
 			info.ipa_ep_pair.cons_pipe_num = port->ipa_consumer_ep;
 			info.ipa_ep_pair.prod_pipe_num = port->ipa_producer_ep;
